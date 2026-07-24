@@ -22,6 +22,26 @@ export default {
 
     try {
       const body = await request.json();
+
+      // Recherche web via Tavily (utilisée par le mode "Search" d'Elion)
+      if (body.tavily_query) {
+        const tavilyRes = await fetch('https://api.tavily.com/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            api_key: env.TAVILY_API_KEY, // <- clé Tavily, uniquement sur le serveur
+            query: body.tavily_query,
+            max_results: 5,
+            include_answer: false,
+          }),
+        });
+        const tavilyData = await tavilyRes.text();
+        return new Response(tavilyData, {
+          status: tavilyRes.status,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+
       // Le client peut préciser quel modèle utiliser (texte ou image) ;
       // par défaut, on garde le modèle de conversation habituel.
       const model = body.model || 'gemini-3.5-flash';

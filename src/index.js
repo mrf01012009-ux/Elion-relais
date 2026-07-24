@@ -1,5 +1,11 @@
+// ---------------------------------------------------------------
+// Relais pour Elion : cache la clé API Gemini côté serveur.
+// Le navigateur du visiteur ne voit jamais la clé.
+// ---------------------------------------------------------------
+
 export default {
   async fetch(request, env) {
+    // Autorise l'appel depuis le navigateur (CORS)
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'POST, OPTIONS',
@@ -16,17 +22,22 @@ export default {
 
     try {
       const body = await request.json();
-      const model = 'gemini-3.5-flash';
+      // Le client peut préciser quel modèle utiliser (texte ou image) ;
+      // par défaut, on garde le modèle de conversation habituel.
+      const model = body.model || 'gemini-3.5-flash';
+      const payload = { ...body };
+      delete payload.model; // Google ne connaît pas ce champ, on ne le transmet pas
+
       const url =
         'https://generativelanguage.googleapis.com/v1beta/models/' +
         model +
         ':generateContent?key=' +
-        env.GEMINI_API_KEY;
+        env.GEMINI_API_KEY; // <- la clé vit ici, uniquement sur le serveur
 
       const geminiRes = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify(payload),
       });
 
       const data = await geminiRes.text();

@@ -42,6 +42,22 @@ export default {
         });
       }
 
+      // Recherche de vraies photos via Pexels (galerie d'images "parle-moi de...")
+      if (body.pexels_query) {
+        const pexelsUrl =
+          'https://api.pexels.com/v1/search?query=' +
+          encodeURIComponent(body.pexels_query) +
+          '&per_page=5&orientation=square';
+        const pexelsRes = await fetch(pexelsUrl, {
+          headers: { Authorization: env.PEXELS_API_KEY }, // <- clé Pexels, uniquement sur le serveur
+        });
+        const pexelsData = await pexelsRes.text();
+        return new Response(pexelsData, {
+          status: pexelsRes.status,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+
       // Le client peut préciser quel modèle utiliser (texte ou image) ;
       // par défaut, on garde le modèle de conversation habituel.
       const model = body.model || 'gemini-3.5-flash';

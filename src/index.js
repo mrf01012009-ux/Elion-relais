@@ -29,7 +29,7 @@ export default {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            api_key: env.TAVILY_API_KEY, // <- clé Tavily, uniquement sur le serveur
+            api_key: env.TAVILY_API_KEY,
             query: body.tavily_query,
             max_results: 5,
             include_answer: false,
@@ -49,7 +49,7 @@ export default {
           encodeURIComponent(body.pexels_query) +
           '&per_page=5&orientation=square';
         const pexelsRes = await fetch(pexelsUrl, {
-          headers: { Authorization: env.PEXELS_API_KEY }, // <- clé Pexels, uniquement sur le serveur
+          headers: { Authorization: env.PEXELS_API_KEY },
         });
         const pexelsData = await pexelsRes.text();
         return new Response(pexelsData, {
@@ -60,15 +60,15 @@ export default {
 
       // Le client peut préciser quel modèle utiliser (texte ou image) ;
       // par défaut, on garde le modèle de conversation habituel.
-      const model = body.model || 'gemini-3.5-flash';
+      const model = body.model || 'gemini-3.5-flash-lite';
       const payload = { ...body };
-      delete payload.model; // Google ne connaît pas ce champ, on ne le transmet pas
+      delete payload.model;
 
       const url =
         'https://generativelanguage.googleapis.com/v1beta/models/' +
         model +
         ':generateContent?key=' +
-        env.GEMINI_API_KEY; // <- la clé vit ici, uniquement sur le serveur
+        env.GEMINI_API_KEY;
 
       const geminiRes = await fetch(url, {
         method: 'POST',

@@ -1,6 +1,7 @@
 // ---------------------------------------------------------------
 // Relais pour Elion : cache les clés API côté serveur
 // Gemini + Tavily + Pexels + Google Auth + Notion
+// URL : https://elionaiq-relais.chichiplay24.workers.dev/
 // ---------------------------------------------------------------
 
 export default {
@@ -71,12 +72,10 @@ export default {
         });
       }
 
-      // ---------- 4. NOTION (nouveau) ----------
-      // Le front appelle { notion_path: "/search", notion_body: {...} }
-      // ou { notion_path: "/users/me" }
+      // ---------- 4. NOTION (via secret) ----------
       if (body.notion_path || url.pathname.startsWith('/api/notion')) {
         if (!env.NOTION_TOKEN) {
-          return new Response(JSON.stringify({ error: 'NOTION_TOKEN manquant dans env' }), { status: 500, headers: corsHeaders });
+          return new Response(JSON.stringify({ error: 'NOTION_TOKEN manquant - fais wrangler secret put NOTION_TOKEN' }), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
         }
         const notionPath = body.notion_path || url.pathname.replace('/api/notion','') || '/search';
         const notionMethod = body.notion_method || (body.notion_body ? 'POST' : 'GET');
@@ -90,7 +89,8 @@ export default {
           },
           body: body.notion_body ? JSON.stringify(body.notion_body) : undefined,
         });
-        return new Response(await notionRes.text(), {
+        const text = await notionRes.text();
+        return new Response(text, {
           status: notionRes.status,
           headers: { 'Content-Type': 'application/json', ...corsHeaders },
         });
@@ -98,7 +98,7 @@ export default {
 
       // ---------- 5. Gemini (par défaut) ----------
       if (request.method !== 'POST') {
-        return new Response('Méthode non autorisée', { status: 405, headers: corsHeaders });
+        return new Response('Elion Relay OK - POST attendu', { status: 200, headers: corsHeaders });
       }
 
       const model = body.model || 'gemini-2.0-flash';
@@ -123,7 +123,7 @@ export default {
     } catch (err) {
       return new Response(JSON.stringify({ error: 'Erreur du relais', details: err.message }), {
         status: 500,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
       });
     }
   },

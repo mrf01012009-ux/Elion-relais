@@ -1,6 +1,5 @@
 // ---------------------------------------------------------------
-// Relais pour Elion : cache les clés API côté serveur
-// Gemini + Tavily + Pexels + Google Auth + Notion
+// Relais pour Elion : Gemini + Tavily + Pexels + Google Auth + Notion + Slack
 // URL : https://elionaiq-relais.chichiplay24.workers.dev/
 // ---------------------------------------------------------------
 
@@ -72,14 +71,13 @@ export default {
         });
       }
 
-      // ---------- 4. NOTION (via secret) ----------
+      // ---------- 4. NOTION ----------
       if (body.notion_path || url.pathname.startsWith('/api/notion')) {
         if (!env.NOTION_TOKEN) {
-          return new Response(JSON.stringify({ error: 'NOTION_TOKEN manquant - fais wrangler secret put NOTION_TOKEN' }), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+          return new Response(JSON.stringify({ error: 'NOTION_TOKEN manquant' }), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
         }
         const notionPath = body.notion_path || url.pathname.replace('/api/notion','') || '/search';
         const notionMethod = body.notion_method || (body.notion_body ? 'POST' : 'GET');
-        
         const notionRes = await fetch(`https://api.notion.com/v1${notionPath}`, {
           method: notionMethod,
           headers: {
@@ -96,7 +94,28 @@ export default {
         });
       }
 
-      // ---------- 5. Gemini (par défaut) ----------
+      // ---------- 4b. SLACK ----------
+      if (body.slack_path) {
+        if (!env.SLACK_TOKEN) {
+          return new Response(JSON.stringify({ error: 'SLACK_TOKEN manquant. Fais wrangler secret put SLACK_TOKEN', ok: false }), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        }
+        const slackUrl = 'https://slack.com/api' + body.slack_path;
+        const slackRes = await fetch(slackUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': 'Bearer ' + env.SLACK_TOKEN,
+            'Content-Type': 'application/json; charset=utf-8'
+          },
+          body: body.slack_body ? JSON.stringify(body.slack_body) : undefined
+        });
+        const slackText = await slackRes.text();
+        return new Response(slackText, {
+          status: slackRes.status,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+
+      // ---------- 5. Gemini ----------
       if (request.method !== 'POST') {
         return new Response('Elion Relay OK - POST attendu', { status: 200, headers: corsHeaders });
       }
@@ -107,6 +126,8 @@ export default {
       delete payload.notion_path;
       delete payload.notion_body;
       delete payload.notion_method;
+      delete payload.slack_path;
+      delete payload.slack_body;
 
       const geminiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + env.GEMINI_API_KEY;
 

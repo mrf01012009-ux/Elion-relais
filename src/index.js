@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------
 // Elion Relay - Gemini + Tavily + Pexels + Google + Notion + Slack
-// Rotation 2 clés Gemini — High Demand seulement si les 2 sont saturées
+// Rotation 2 clés — High Demand seulement si les 2 sont saturées
 // ---------------------------------------------------------------
 
 export default {
@@ -39,7 +39,7 @@ export default {
         const hasCode = bodyText && bodyText.includes(ownerCodeEnv);
         if (isImpersonation) {
           console.log(
-            'Impersonation attempt detected, hasCode:',
+            'Impersonation attempt, hasCode:',
             hasCode,
             'IP:',
             request.headers.get('cf-connecting-ip')
@@ -127,10 +127,10 @@ export default {
         const nPath =
           body.notion_path || url.pathname.replace('/api/notion', '') || '/search';
         const nMethod = body.notion_method || (body.notion_body ? 'POST' : 'GET');
-        const r = await fetch(`https://api.notion.com/v1${nPath}`, {
+        const r = await fetch('https://api.notion.com/v1' + nPath, {
           method: nMethod,
           headers: {
-            Authorization: `Bearer ${env.NOTION_TOKEN}`,
+            Authorization: 'Bearer ' + env.NOTION_TOKEN,
             'Notion-Version': '2022-06-28',
             'Content-Type': 'application/json',
           },
@@ -168,21 +168,18 @@ export default {
       }
 
       // ---------------------------------------------------------------
-      // Gemini — rotation 2 clés + fallback modèles
-      // High Demand UNIQUEMENT si toutes les clés sont saturées
+      // Gemini — 2 clés max, 2 modèles max (rapide)
       // ---------------------------------------------------------------
       if (request.method !== 'POST') {
         return new Response('Elion Relay OK', { status: 200, headers: corsHeaders });
       }
 
       const model = body.model || 'gemini-2.0-flash';
-      const fallbackModels = Array.isArray(body.fallback_models)
-        ? body.fallback_models
-        : ['gemini-2.0-flash-lite', 'gemini-1.5-flash'];
+      // Un seul fallback pour éviter les attentes de 10 min
+      const fallbackModels = ['gemini-2.0-flash-lite'];
 
       const clientKey = body.api_key || body.apiKey || body.key || '';
 
-      // Payload propre pour Gemini
       const payload = { ...body };
       delete payload.model;
       delete payload.fallback_models;
@@ -202,15 +199,13 @@ export default {
       delete payload.redirect_uri;
       delete payload.code_verifier;
 
-      // Ordre des clés
+      // Clés : Worker 1 → Worker 2 → client
       const keys = [];
       if (env.GEMINI_API_KEY) keys.push(env.GEMINI_API_KEY);
       if (env.GEMINI_API_KEY_2 && keys.indexOf(env.GEMINI_API_KEY_2) < 0) {
         keys.push(env.GEMINI_API_KEY_2);
       }
-      if (clientKey && keys.indexOf(clientKey) < 0) {
-        keys.push(clientKey);
-      }
+      if (clientKey && keys.indexOf(clientKey) < 0) keys.push(clientKey);
 
       if (!keys.length) {
         return new Response(
@@ -222,11 +217,11 @@ export default {
         );
       }
 
-      const modelsToTry = [model].concat(
-        fallbackModels.filter((m) => m && m !== model)
-      );
+      const modelsToTry = [model];
+      if (fallbackModels[0] && fallbackModels[0] !== model) {
+        modelsToTry.push(fallbackModels[0]);
+      }
 
-      let lastStatus = 500;
       let lastText = '';
 
       for (const apiKey of keys) {
@@ -237,13 +232,27 @@ export default {
             ':generateContent?key=' +
             apiKey;
 
-          const geminiRes = await fetch(geminiUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-          });
-          const gemText = await geminiRes.text();
-          lastStatus = geminiRes.status;
+          // Timeout 20s par appel Gemini
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), 20000);
+
+          let geminiRes;
+          let gemText;
+          try {
+            geminiRes = await fetch(geminiUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+              signal: ctrl.signal,
+            });
+            gemText = await geminiRes.text();
+          } catch (e) {
+            clearTimeout(t);
+            console.log('Gemini timeout/error', m, e.message);
+            lastText = e.message || 'timeout';
+            continue;
+          }
+          clearTimeout(t);
           lastText = gemText;
 
           if (geminiRes.ok) {
@@ -258,11 +267,10 @@ export default {
             /resource.exhausted|quota|high demand|rate limit/i.test(gemText);
 
           if (isQuota) {
-            console.log('Quota hit — model:', m, '→ next key/model');
+            console.log('Quota hit —', m, '→ next');
             continue;
           }
 
-          // Erreur non-quota (400, 403…) → on renvoie tel quel
           return new Response(gemText, {
             status: geminiRes.status,
             headers: { 'Content-Type': 'application/json', ...corsHeaders },
@@ -270,14 +278,13 @@ export default {
         }
       }
 
-      // Toutes les clés + modèles saturés
       return new Response(
         JSON.stringify({
           error: {
             message: 'HIGH_DEMAND',
             details:
               'Les clés Gemini sont saturées. Réessaie dans quelques minutes. ' +
-              lastText.slice(0, 400),
+              String(lastText).slice(0, 400),
           },
           high_demand: true,
         }),

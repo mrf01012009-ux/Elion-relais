@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------
 // Elion Relay - Gemini + Tavily + Pexels + Google + Notion + Slack
-// Rotation 2 clés — High Demand seulement si les 2 sont saturées
+// Clés AQ. via x-goog-api-key | Rotation 2 clés | High Demand si tout saturé
 // ---------------------------------------------------------------
 
 export default {
@@ -168,16 +168,17 @@ export default {
       }
 
       // ---------------------------------------------------------------
-      // Gemini — 2 clés max, 2 modèles max (rapide)
+      // Gemini — clés AQ. via header x-goog-api-key + rotation
       // ---------------------------------------------------------------
       if (request.method !== 'POST') {
-        return new Response('Elion Relay OK', { status: 200, headers: corsHeaders });
+        return new Response('Elion Relay OK', {
+          status: 200,
+          headers: corsHeaders,
+        });
       }
 
       const model = body.model || 'gemini-2.0-flash';
-      // Un seul fallback pour éviter les attentes de 10 min
       const fallbackModels = ['gemini-2.0-flash-lite'];
-
       const clientKey = body.api_key || body.apiKey || body.key || '';
 
       const payload = { ...body };
@@ -199,7 +200,6 @@ export default {
       delete payload.redirect_uri;
       delete payload.code_verifier;
 
-      // Clés : Worker 1 → Worker 2 → client
       const keys = [];
       if (env.GEMINI_API_KEY) keys.push(env.GEMINI_API_KEY);
       if (env.GEMINI_API_KEY_2 && keys.indexOf(env.GEMINI_API_KEY_2) < 0) {
@@ -229,52 +229,57 @@ export default {
           const geminiUrl =
             'https://generativelanguage.googleapis.com/v1beta/models/' +
             m +
-            ':generateContent?key=' +
-            apiKey;
+            ':generateContent';
 
-          // Timeout 20s par appel Gemini
           const ctrl = new AbortController();
-          const t = setTimeout(() => ctrl.abort(), 20000);
+          const t = setTimeout(() => ctrl.abort(), 25000);
 
-          let geminiRes;
-          let gemText;
           try {
-            geminiRes = await fetch(geminiUrl, {
+            const geminiRes = await fetch(geminiUrl, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: {
+                'Content-Type': 'application/json',
+                'x-goog-api-key': apiKey,
+              },
               body: JSON.stringify(payload),
               signal: ctrl.signal,
             });
-            gemText = await geminiRes.text();
-          } catch (e) {
             clearTimeout(t);
-            console.log('Gemini timeout/error', m, e.message);
-            lastText = e.message || 'timeout';
-            continue;
-          }
-          clearTimeout(t);
-          lastText = gemText;
+            const gemText = await geminiRes.text();
+            lastText = gemText;
 
-          if (geminiRes.ok) {
+            if (geminiRes.ok) {
+              return new Response(gemText, {
+                status: 200,
+                headers: { 'Content-Type': 'application/json', ...corsHeaders },
+              });
+            }
+
+            const isQuota =
+              geminiRes.status === 429 ||
+              /resource.exhausted|quota|high demand|rate limit/i.test(gemText);
+
+            if (isQuota) {
+              console.log('Quota hit —', m);
+              continue;
+            }
+
+            // Clé refusée → essaie la suivante
+            if (geminiRes.status === 401 || geminiRes.status === 403) {
+              console.log('Auth fail — next key');
+              continue;
+            }
+
             return new Response(gemText, {
-              status: 200,
+              status: geminiRes.status,
               headers: { 'Content-Type': 'application/json', ...corsHeaders },
             });
-          }
-
-          const isQuota =
-            geminiRes.status === 429 ||
-            /resource.exhausted|quota|high demand|rate limit/i.test(gemText);
-
-          if (isQuota) {
-            console.log('Quota hit —', m, '→ next');
+          } catch (e) {
+            clearTimeout(t);
+            lastText = e.message || 'timeout';
+            console.log('Gemini error', m, lastText);
             continue;
           }
-
-          return new Response(gemText, {
-            status: geminiRes.status,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders },
-          });
         }
       }
 
@@ -283,8 +288,7 @@ export default {
           error: {
             message: 'HIGH_DEMAND',
             details:
-              'Les clés Gemini sont saturées. Réessaie dans quelques minutes. ' +
-              String(lastText).slice(0, 400),
+              'Clés saturées ou invalides. ' + String(lastText).slice(0, 400),
           },
           high_demand: true,
         }),

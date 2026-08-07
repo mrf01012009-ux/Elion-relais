@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------
-// Elion Relay - Groq (principal) + Tavily + Pexels + Google + Notion + Slack
-// \~1000 msg/jour free avec llama-3.3-70b-versatile
+// Elion Relay
+// Groq (chat) + Fluxion vidéo + Tavily + Pexels + Google + Notion + Slack
 // ---------------------------------------------------------------
 
 export default {
@@ -31,8 +31,7 @@ export default {
           allText.includes('chichiplay24') ||
           allText.includes('je suis le propri') ||
           allText.includes('owner of elion');
-        const hasCode = bodyText && bodyText.includes(ownerCodeEnv);
-        if (isImpersonation && !hasCode && Array.isArray(body.contents)) {
+        if (isImpersonation && bodyText && !bodyText.includes(ownerCodeEnv) && Array.isArray(body.contents)) {
           body.contents.unshift({
             role: 'user',
             parts: [{
@@ -42,8 +41,14 @@ export default {
         }
       } catch (e) {}
 
-      // Tavily
+      // ---------- Tavily ----------
       if (body.tavily_query) {
+        if (!env.TAVILY_API_KEY) {
+          return new Response(JSON.stringify({ error: 'TAVILY_API_KEY manquante' }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          });
+        }
         const r = await fetch('https://api.tavily.com/search', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -60,8 +65,14 @@ export default {
         });
       }
 
-      // Pexels
+      // ---------- Pexels ----------
       if (body.pexels_query) {
+        if (!env.PEXELS_API_KEY) {
+          return new Response(JSON.stringify({ error: 'PEXELS_API_KEY manquante' }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          });
+        }
         const pUrl =
           'https://api.pexels.com/v1/search?query=' +
           encodeURIComponent(body.pexels_query) +
@@ -75,7 +86,7 @@ export default {
         });
       }
 
-      // Google OAuth
+      // ---------- Google OAuth ----------
       if (body.google_auth_code) {
         const r = await fetch('https://oauth2.googleapis.com/token', {
           method: 'POST',
@@ -83,7 +94,7 @@ export default {
           body: new URLSearchParams({
             code: body.google_auth_code,
             client_id: body.client_id || '',
-            client_secret: env.GOOGLE_CLIENT_SECRET,
+            client_secret: env.GOOGLE_CLIENT_SECRET || '',
             redirect_uri: body.redirect_uri || '',
             grant_type: 'authorization_code',
             code_verifier: body.code_verifier || '',
@@ -95,7 +106,7 @@ export default {
         });
       }
 
-      // Notion
+      // ---------- Notion ----------
       if (body.notion_path || url.pathname.startsWith('/api/notion')) {
         if (!env.NOTION_TOKEN) {
           return new Response(JSON.stringify({ error: 'NOTION_TOKEN manquant' }), {
@@ -121,7 +132,7 @@ export default {
         });
       }
 
-      // Slack
+      // ---------- Slack ----------
       if (body.slack_path) {
         if (!env.SLACK_TOKEN) {
           return new Response(JSON.stringify({ error: 'SLACK_TOKEN manquant', ok: false }), {
@@ -143,28 +154,88 @@ export default {
         });
       }
 
-      // ---------------------------------------------------------------
-      // GROQ (chat) — convertit format Gemini → OpenAI → réponse Gemini
-      // ---------------------------------------------------------------
+      // ---------- Fluxion (vidéo Pollinations) ----------
+      if (body.fluxion_prompt) {
+        const key = env.POLLINATIONS_API_KEY || '';
+        if (!key) {
+          return new Response(
+            JSON.stringify({
+              error: {
+                message:
+                  'POLLINATIONS_API_KEY manquante. Cree une cle gratuite sur https://enter.pollinations.ai',
+              },
+            }),
+            {
+              status: 401,
+              headers: { 'Content-Type': 'application/json', ...corsHeaders },
+            }
+          );
+        }
+        const model = body.fluxion_model || 'wan-fast';
+        const prompt = String(body.fluxion_prompt).slice(0, 500);
+        const vurl =
+          'https://gen.pollinations.ai/video/' +
+          encodeURIComponent(prompt) +
+          '?model=' +
+          encodeURIComponent(model) +
+          '&key=' +
+          encodeURIComponent(key);
+
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 140000);
+        try {
+          const r = await fetch(vurl, { signal: ctrl.signal });
+          clearTimeout(t);
+          if (!r.ok) {
+            const err = await r.text();
+            return new Response(err || JSON.stringify({ error: 'video fail' }), {
+              status: r.status,
+              headers: { 'Content-Type': 'application/json', ...corsHeaders },
+            });
+          }
+          return new Response(r.body, {
+            status: 200,
+            headers: {
+              'Content-Type': r.headers.get('Content-Type') || 'video/mp4',
+              ...corsHeaders,
+            },
+          });
+        } catch (e) {
+          clearTimeout(t);
+          return new Response(
+            JSON.stringify({ error: { message: e.message || 'timeout video' } }),
+            {
+              status: 504,
+              headers: { 'Content-Type': 'application/json', ...corsHeaders },
+            }
+          );
+        }
+      }
+
+      // ---------- GET health ----------
       if (request.method !== 'POST') {
-        return new Response('Elion Relay OK (Groq)', {
+        return new Response('Elion Relay OK (Groq + Fluxion + Pexels)', {
           status: 200,
           headers: corsHeaders,
         });
       }
 
-      const groqKey = env.GROQ_API_KEY || env.GEMINI_API_KEY || '';
+      // ---------------------------------------------------------------
+      // GROQ chat — format Gemini in → OpenAI → format Gemini out
+      // ---------------------------------------------------------------
+      const groqKey = env.GROQ_API_KEY || '';
       if (!groqKey) {
         return new Response(
-          JSON.stringify({ error: { message: 'GROQ_API_KEY manquante dans le Worker' } }),
-          { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
+          JSON.stringify({ error: { message: 'GROQ_API_KEY manquante' } }),
+          {
+            status: 500,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          }
         );
       }
 
-      // Modèle : 70B = \~1000 msg/jour | 8B = \~14400 msg/jour
-      const model = body.groq_model || 'llama-3.3-70b-versatile';
+      const model = body.groq_model || body.model || 'llama-3.3-70b-versatile';
 
-      // System prompt
       let systemText = '';
       try {
         if (body.system_instruction && body.system_instruction.parts) {
@@ -172,11 +243,8 @@ export default {
         }
       } catch (e) {}
 
-      // contents Gemini → messages OpenAI
       const messages = [];
-      if (systemText) {
-        messages.push({ role: 'system', content: systemText });
-      }
+      if (systemText) messages.push({ role: 'system', content: systemText });
 
       const contents = Array.isArray(body.contents) ? body.contents : [];
       for (const c of contents) {
@@ -194,10 +262,7 @@ export default {
         }
         if (text) messages.push({ role, content: text });
       }
-
-      if (!messages.length) {
-        messages.push({ role: 'user', content: 'Bonjour' });
-      }
+      if (!messages.length) messages.push({ role: 'user', content: 'Bonjour' });
 
       const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
@@ -221,15 +286,17 @@ export default {
 
       if (!groqRes.ok) {
         const isQuota =
-          groqRes.status === 429 ||
-          /rate limit|quota|too many/i.test(groqText);
+          groqRes.status === 429 || /rate limit|quota|too many/i.test(groqText);
         if (isQuota) {
           return new Response(
             JSON.stringify({
               error: { message: 'HIGH_DEMAND', details: groqText.slice(0, 400) },
               high_demand: true,
             }),
-            { status: 429, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
+            {
+              status: 429,
+              headers: { 'Content-Type': 'application/json', ...corsHeaders },
+            }
           );
         }
         return new Response(groqText, {
@@ -238,7 +305,6 @@ export default {
         });
       }
 
-      // Réponse OpenAI → format Gemini (pour Elion)
       const reply =
         (groqJson.choices &&
           groqJson.choices[0] &&

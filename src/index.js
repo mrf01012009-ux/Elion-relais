@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------
 // Elion Relay
-// Groq (chat) + Fluxion vidéo + Tavily + Pexels + Google + Notion + Slack
+// Groq (chat) + Gemini (analyse Works) + Fluxion vidéo + Tavily + Pexels + Google + Notion + Slack
 // ---------------------------------------------------------------
 
 export default {
@@ -214,14 +214,58 @@ export default {
 
       // ---------- GET health ----------
       if (request.method !== 'POST') {
-        return new Response('Elion Relay OK (Groq + Fluxion + Pexels)', {
+        return new Response('Elion Relay OK (Groq + Gemini + Fluxion + Pexels)', {
           status: 200,
           headers: corsHeaders,
         });
       }
 
       // ---------------------------------------------------------------
+      // GEMINI — analyse Works (docs/fichiers/images). Appel direct API Google.
+      // ---------------------------------------------------------------
+      if (body.provider === 'gemini' || body.force_gemini) {
+        const geminiKey = env.GEMINI_API_KEY || '';
+        if (!geminiKey) {
+          return new Response(
+            JSON.stringify({
+              error: {
+                message:
+                  'GEMINI_API_KEY manquante. Cree une cle gratuite sur https://aistudio.google.com/apikey',
+              },
+            }),
+            {
+              status: 500,
+              headers: { 'Content-Type': 'application/json', ...corsHeaders },
+            }
+          );
+        }
+        const geminiModel = body.gemini_model || body.model || 'gemini-1.5-flash';
+        const geminiUrl =
+          'https://generativelanguage.googleapis.com/v1beta/models/' +
+          encodeURIComponent(geminiModel) +
+          ':generateContent?key=' +
+          encodeURIComponent(geminiKey);
+
+        const geminiPayload = { contents: Array.isArray(body.contents) ? body.contents : [] };
+        if (body.system_instruction) geminiPayload.system_instruction = body.system_instruction;
+        if (body.generationConfig) geminiPayload.generationConfig = body.generationConfig;
+
+        const gRes = await fetch(geminiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(geminiPayload),
+        });
+        const gText = await gRes.text();
+        return new Response(gText, {
+          status: gRes.status,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+
+      // ---------------------------------------------------------------
       // GROQ chat — format Gemini in → OpenAI → format Gemini out
+      // (utilisé pour le chat normal ET pour Works · réponse, avec un
+      // modèle de raisonnement comme qwen/qwen3.6-27b si demandé)
       // ---------------------------------------------------------------
       const groqKey = env.GROQ_API_KEY || '';
       if (!groqKey) {
@@ -264,18 +308,22 @@ export default {
       }
       if (!messages.length) messages.push({ role: 'user', content: 'Bonjour' });
 
+      const groqBody = {
+        model,
+        messages,
+        temperature: (body.generationConfig && body.generationConfig.temperature) || 0.7,
+        max_tokens: (body.generationConfig && body.generationConfig.maxOutputTokens) || 2048,
+      };
+      // Modèles de raisonnement (ex. qwen/qwen3.6-27b) : réflexion visible dans <think>
+      if (body.reasoning_format) groqBody.reasoning_format = body.reasoning_format;
+
       const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
         headers: {
           Authorization: 'Bearer ' + groqKey,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          model,
-          messages,
-          temperature: (body.generationConfig && body.generationConfig.temperature) || 0.7,
-          max_tokens: (body.generationConfig && body.generationConfig.maxOutputTokens) || 2048,
-        }),
+        body: JSON.stringify(groqBody),
       });
 
       const groqText = await groqRes.text();
@@ -305,12 +353,18 @@ export default {
         });
       }
 
-      const reply =
+      const reasoningContent =
         (groqJson.choices &&
           groqJson.choices[0] &&
           groqJson.choices[0].message &&
+          groqJson.choices[0].message.reasoning) || '';
+      const reply =
+        (reasoningContent ? '<think>' + reasoningContent + '</think>\n' : '') +
+        ((groqJson.choices &&
+          groqJson.choices[0] &&
+          groqJson.choices[0].message &&
           groqJson.choices[0].message.content) ||
-        '';
+          '');
 
       const geminiShape = {
         candidates: [

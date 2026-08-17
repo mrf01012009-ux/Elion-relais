@@ -278,7 +278,7 @@ export default {
         );
       }
 
-      const model = body.groq_model || body.model || 'llama-3.3-70b-versatile';
+      const model = body.groq_model || body.model || 'openai/gpt-oss-120b';
 
       let systemText = '';
       try {

@@ -239,7 +239,7 @@ export default {
             }
           );
         }
-        const geminiModel = body.gemini_model || body.model || 'gemini-1.5-flash';
+        const geminiModel = body.gemini_model || body.model || 'gemini-2.5-flash';
         const geminiUrl =
           'https://generativelanguage.googleapis.com/v1beta/models/' +
           encodeURIComponent(geminiModel) +

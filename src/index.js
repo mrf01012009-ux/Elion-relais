@@ -212,9 +212,65 @@ export default {
         }
       }
 
+      // ---------- Pixazo Tracks (musique Sonaria — remplace Colab/Gradio) ----------
+      if (body.pixazo_prompt) {
+        const pxKey = env.PIXAZO_API_KEY || '';
+        if (!pxKey) {
+          return new Response(
+            JSON.stringify({
+              error: {
+                message:
+                  'PIXAZO_API_KEY manquante. Cree une cle gratuite sur https://www.pixazo.ai',
+              },
+            }),
+            { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
+          );
+        }
+        const r = await fetch('https://gateway.pixazo.ai/tracks/v1/generate', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-cache',
+            'Ocp-Apim-Subscription-Key': pxKey,
+          },
+          body: JSON.stringify({
+            prompt: String(body.pixazo_prompt).slice(0, 500) + ', instrumental only, no vocals, no singing',
+            lyrics: '',
+            duration: body.pixazo_duration || 35,
+            bpm: body.pixazo_bpm || 100,
+            key: body.pixazo_key || 'C major',
+            time_signature: '4/4',
+            seed: body.pixazo_seed || Math.floor(Math.random() * 1000000),
+          }),
+        });
+        return new Response(await r.text(), {
+          status: r.status,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+
+      // ---------- Pixazo — vérification du statut (soumission Tracks ou autre modèle) ----------
+      if (body.pixazo_poll_id) {
+        const pxKey = env.PIXAZO_API_KEY || '';
+        if (!pxKey) {
+          return new Response(
+            JSON.stringify({ error: { message: 'PIXAZO_API_KEY manquante' } }),
+            { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
+          );
+        }
+        const r = await fetch(
+          'https://gateway.pixazo.ai/v2/requests/status/' + encodeURIComponent(body.pixazo_poll_id),
+          { headers: { 'Ocp-Apim-Subscription-Key': pxKey } }
+        );
+        return new Response(await r.text(), {
+          status: r.status,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+
       // ---------- GET health ----------
       if (request.method !== 'POST') {
-        return new Response('Elion Relay OK (Groq + Gemini + Fluxion + Pexels)', {
+        return new Response('Elion Relay OK (Groq + Gemini + Fluxion + Pixazo Tracks + Pexels)', {
           status: 200,
           headers: corsHeaders,
         });

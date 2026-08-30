@@ -1,6 +1,5 @@
 // ---------------------------------------------------------------
-// Elion Relay
-// Groq (chat) + Gemini (analyse Works) + Fluxion vidéo + Tavily + Pexels + Google + Notion + Slack
+// Elion Relay Worker — Groq + Gemini + Sonaria (Tracks) + Fluxion LTX + Pexels + Tavily
 // ---------------------------------------------------------------
 
 export default {
@@ -212,7 +211,7 @@ export default {
         }
       }
 
-      // ---------- Pixazo LTX Video (Fluxion — remplace Pollinations/sk_) ----------
+      // ---------- Pixazo LTX Video (Fluxion) ----------
       if (body.pixazo_video_prompt) {
         const pxKey = env.PIXAZO_API_KEY || '';
         if (!pxKey) {
@@ -244,7 +243,7 @@ export default {
         });
       }
 
-      // ---------- Pixazo LTX Video (Fluxion vidéo — remplace Pollinations) ----------
+      // ---------- Pixazo LTX Video (alias ltx_prompt) ----------
       if (body.ltx_prompt) {
         const pxKey = env.PIXAZO_API_KEY || '';
         if (!pxKey) {
@@ -277,8 +276,44 @@ export default {
         });
       }
 
+      // ---------- Pixazo Tracks (Sonaria — musique) ----------
+      if (body.pixazo_prompt) {
+        const pxKey = env.PIXAZO_API_KEY || '';
+        if (!pxKey) {
+          return new Response(
+            JSON.stringify({
+              error: {
+                message:
+                  'PIXAZO_API_KEY manquante. Cree une cle gratuite sur https://www.pixazo.ai',
+              },
+            }),
+            { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
+          );
+        }
+        const duration = Math.min(
+          120,
+          Math.max(15, parseInt(body.pixazo_duration, 10) || 35)
+        );
+        const r = await fetch('https://gateway.pixazo.ai/tracks/v1/generate', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-cache',
+            'Ocp-Apim-Subscription-Key': pxKey,
+          },
+          body: JSON.stringify({
+            prompt: String(body.pixazo_prompt).slice(0, 2000),
+            lyrics: '',
+            duration: duration,
+          }),
+        });
+        return new Response(await r.text(), {
+          status: r.status,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
 
-      // ---------- Pixazo — vérification du statut (soumission Tracks ou autre modèle) ----------
+      // ---------- Pixazo — poll statut (Sonaria / Fluxion) ----------
       if (body.pixazo_poll_id) {
         const pxKey = env.PIXAZO_API_KEY || '';
         if (!pxKey) {
@@ -299,14 +334,14 @@ export default {
 
       // ---------- GET health ----------
       if (request.method !== 'POST') {
-        return new Response('Elion Relay OK (Groq + Gemini + Pixazo Tracks + Pixazo LTX + Pexels)', {
+        return new Response('Elion Relay OK (Groq + Gemini + Sonaria/Tracks + Pixazo LTX + Pexels)', {
           status: 200,
           headers: corsHeaders,
         });
       }
 
       // ---------------------------------------------------------------
-      // GEMINI — analyse Works (docs/fichiers/images). Appel direct API Google.
+      // GEMINI
       // ---------------------------------------------------------------
       if (body.provider === 'gemini' || body.force_gemini) {
         const geminiKey = env.GEMINI_API_KEY || '';
@@ -348,9 +383,7 @@ export default {
       }
 
       // ---------------------------------------------------------------
-      // GROQ chat — format Gemini in → OpenAI → format Gemini out
-      // (utilisé pour le chat normal ET pour Works · réponse, avec un
-      // modèle de raisonnement comme qwen/qwen3.6-27b si demandé)
+      // GROQ chat
       // ---------------------------------------------------------------
       const groqKey = env.GROQ_API_KEY || '';
       if (!groqKey) {
@@ -399,7 +432,6 @@ export default {
         temperature: (body.generationConfig && body.generationConfig.temperature) || 0.7,
         max_tokens: (body.generationConfig && body.generationConfig.maxOutputTokens) || 2048,
       };
-      // Modèles de raisonnement (ex. qwen/qwen3.6-27b) : réflexion visible dans <think>
       if (body.reasoning_format) groqBody.reasoning_format = body.reasoning_format;
 
       const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {

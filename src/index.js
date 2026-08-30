@@ -313,7 +313,7 @@ export default {
         });
       }
 
-      // ---------- Pixazo — poll statut (Sonaria / Fluxion) ----------
+      // ---------- Pixazo — poll statut ----------
       if (body.pixazo_poll_id) {
         const pxKey = env.PIXAZO_API_KEY || '';
         if (!pxKey) {
@@ -332,16 +332,28 @@ export default {
         });
       }
 
-      // ---------- GET health ----------
+      // ---------- GET health (+ diag clés, sans valeurs) ----------
       if (request.method !== 'POST') {
-        return new Response(
-          'Elion Relay OK (Groq + Gemini vision + Sonaria/Tracks + Pixazo LTX + Pexels)',
-          { status: 200, headers: corsHeaders }
-        );
+        const diag = {
+          ok: true,
+          service: 'Elion Relay',
+          features: ['groq', 'gemini-vision', 'sonaria-tracks', 'fluxion-ltx', 'pexels', 'tavily'],
+          env: {
+            GEMINI_API_KEY: !!(env.GEMINI_API_KEY && String(env.GEMINI_API_KEY).trim()),
+            GEMINI_API_KEY_2: !!(env.GEMINI_API_KEY_2 && String(env.GEMINI_API_KEY_2).trim()),
+            GEMINI_KEY: !!(env.GEMINI_KEY && String(env.GEMINI_KEY).trim()),
+            GROQ_API_KEY: !!(env.GROQ_API_KEY && String(env.GROQ_API_KEY).trim()),
+            PIXAZO_API_KEY: !!(env.PIXAZO_API_KEY && String(env.PIXAZO_API_KEY).trim()),
+          },
+        };
+        return new Response(JSON.stringify(diag, null, 2), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
       }
 
       // ---------------------------------------------------------------
-      // GEMINI — vision / docs / Works (force_gemini)
+      // GEMINI — vision / docs / Works
       // ---------------------------------------------------------------
       if (body.provider === 'gemini' || body.force_gemini || body.force_vision || body.has_image) {
         const keys = [env.GEMINI_API_KEY, env.GEMINI_API_KEY_2, env.GEMINI_KEY]
@@ -593,3 +605,6 @@ export default {
           },
         }
       );
+    }
+  },
+};

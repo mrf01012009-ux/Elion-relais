@@ -404,10 +404,11 @@ export default {
         const preferred = body.gemini_model || body.model || 'gemini-2.0-flash';
         modelsToTry.push(preferred);
         for (const m of [
-          'gemini-2.0-flash',
-          'gemini-2.5-flash',
-          'gemini-1.5-flash',
-          'gemini-1.5-flash-latest',
+          'gemini-2.5-flash'
+          'gemini-3.5-flash'
+          'gemini-3.7-flash'
+          'gemini-3.6-flash'
+          'gemini-2.0-flash'
         ]) {
           if (!modelsToTry.includes(m)) modelsToTry.push(m);
         }

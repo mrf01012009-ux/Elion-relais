@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------
-// Elion Relay Worker — Groq + Gemini + Sonaria (Tracks) + Fluxion LTX + Pexels + Tavily
+// Elion Relay — Groq + Gemini vision + Sonaria Tracks + Fluxion LTX + Pexels + Tavily
 // ---------------------------------------------------------------
 
 export default {
@@ -334,23 +334,25 @@ export default {
 
       // ---------- GET health ----------
       if (request.method !== 'POST') {
-        return new Response('Elion Relay OK (Groq + Gemini + Sonaria/Tracks + Pixazo LTX + Pexels)', {
-          status: 200,
-          headers: corsHeaders,
-        });
+        return new Response(
+          'Elion Relay OK (Groq + Gemini vision + Sonaria/Tracks + Pixazo LTX + Pexels)',
+          { status: 200, headers: corsHeaders }
+        );
       }
 
       // ---------------------------------------------------------------
-      // GEMINI
+      // GEMINI — vision / docs / Works (force_gemini)
       // ---------------------------------------------------------------
-      if (body.provider === 'gemini' || body.force_gemini) {
-        const geminiKey = env.GEMINI_API_KEY || '';
-        if (!geminiKey) {
+      if (body.provider === 'gemini' || body.force_gemini || body.force_vision || body.has_image) {
+        const keys = [env.GEMINI_API_KEY, env.GEMINI_API_KEY_2, env.GEMINI_KEY]
+          .map((k) => (k || '').trim())
+          .filter(Boolean);
+        if (!keys.length) {
           return new Response(
             JSON.stringify({
               error: {
                 message:
-                  'GEMINI_API_KEY manquante. Cree une cle gratuite sur https://aistudio.google.com/apikey',
+                  'GEMINI_API_KEY manquante sur le Worker. Cloudflare → Settings → Variables → GEMINI_API_KEY',
               },
             }),
             {
@@ -359,27 +361,108 @@ export default {
             }
           );
         }
-        const geminiModel = body.gemini_model || body.model || 'gemini-2.5-flash';
-        const geminiUrl =
-          'https://generativelanguage.googleapis.com/v1beta/models/' +
-          encodeURIComponent(geminiModel) +
-          ':generateContent?key=' +
-          encodeURIComponent(geminiKey);
 
-        const geminiPayload = { contents: Array.isArray(body.contents) ? body.contents : [] };
-        if (body.system_instruction) geminiPayload.system_instruction = body.system_instruction;
-        if (body.generationConfig) geminiPayload.generationConfig = body.generationConfig;
+        function normalizeContents(contents) {
+          if (!Array.isArray(contents)) return [];
+          return contents.map((c) => {
+            const role = c.role === 'assistant' ? 'model' : (c.role || 'user');
+            const partsIn = Array.isArray(c.parts) ? c.parts : [];
+            const parts = [];
+            for (const p of partsIn) {
+              if (!p) continue;
+              if (p.text != null && String(p.text).length) {
+                parts.push({ text: String(p.text) });
+                continue;
+              }
+              const raw = p.inline_data || p.inlineData;
+              if (raw && raw.data) {
+                parts.push({
+                  inline_data: {
+                    mime_type: raw.mime_type || raw.mimeType || 'image/jpeg',
+                    data: String(raw.data).replace(/^data:[^;]+;base64,/, ''),
+                  },
+                });
+              }
+            }
+            return { role, parts: parts.length ? parts : [{ text: '.' }] };
+          });
+        }
 
-        const gRes = await fetch(geminiUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(geminiPayload),
-        });
-        const gText = await gRes.text();
-        return new Response(gText, {
-          status: gRes.status,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders },
-        });
+        const modelsToTry = [];
+        const preferred = body.gemini_model || body.model || 'gemini-2.0-flash';
+        modelsToTry.push(preferred);
+        for (const m of [
+          'gemini-2.0-flash',
+          'gemini-2.5-flash',
+          'gemini-1.5-flash',
+          'gemini-1.5-flash-latest',
+        ]) {
+          if (!modelsToTry.includes(m)) modelsToTry.push(m);
+        }
+
+        const geminiPayload = {
+          contents: normalizeContents(body.contents),
+        };
+        if (body.system_instruction) {
+          geminiPayload.system_instruction = body.system_instruction;
+        }
+        if (body.generationConfig) {
+          const gc = Object.assign({}, body.generationConfig);
+          try {
+            delete gc.thinkingConfig;
+          } catch (e) {}
+          geminiPayload.generationConfig = gc;
+        }
+
+        let lastErr = '';
+        let lastStatus = 500;
+        for (const geminiKey of keys) {
+          for (const geminiModel of modelsToTry) {
+            const geminiUrl =
+              'https://generativelanguage.googleapis.com/v1beta/models/' +
+              encodeURIComponent(geminiModel) +
+              ':generateContent?key=' +
+              encodeURIComponent(geminiKey);
+            try {
+              const gRes = await fetch(geminiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(geminiPayload),
+              });
+              const gText = await gRes.text();
+              if (gRes.ok) {
+                return new Response(gText, {
+                  status: 200,
+                  headers: { 'Content-Type': 'application/json', ...corsHeaders },
+                });
+              }
+              lastStatus = gRes.status;
+              lastErr = gText.slice(0, 600);
+              if (gRes.status === 401 || gRes.status === 403) break;
+              if (gRes.status === 404) continue;
+            } catch (eFetch) {
+              lastErr = eFetch.message || String(eFetch);
+              lastStatus = 502;
+            }
+          }
+        }
+
+        return new Response(
+          JSON.stringify({
+            error: {
+              message:
+                'Gemini vision a échoué. ' +
+                (lastErr
+                  ? String(lastErr).replace(/\s+/g, ' ').slice(0, 400)
+                  : 'Vérifie GEMINI_API_KEY, le modèle, et la taille de l\'image.'),
+            },
+            high_demand: lastStatus === 429,
+          }),
+          {
+            status: lastStatus === 429 ? 429 : 502,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          }
+        );
       }
 
       // ---------------------------------------------------------------
@@ -416,7 +499,7 @@ export default {
           text = c.parts
             .map((p) => {
               if (p.text) return p.text;
-              if (p.inline_data) return '[image/fichier joint]';
+              if (p.inline_data || p.inlineData) return '[image/fichier joint]';
               return '';
             })
             .filter(Boolean)
@@ -510,6 +593,3 @@ export default {
           },
         }
       );
-    }
-  },
-};

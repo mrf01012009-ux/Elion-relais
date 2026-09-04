@@ -1,6 +1,4 @@
 // ---------------------------------------------------------------
-// Elion Relay — Groq + Gemini vision + Sonaria Tracks + Fluxion LTX + Pexels + Tavily
-// ---------------------------------------------------------------
 
 export default {
   async fetch(request, env) {
@@ -83,6 +81,99 @@ export default {
           status: r.status,
           headers: { 'Content-Type': 'application/json', ...corsHeaders },
         });
+      }
+
+
+      // ---------- Illustro / Pollinations (Flux 2 — clé côté Worker) ----------
+      // GET  /api/illustro?prompt=...&width=1024&height=1024&model=flux-2-flex
+      // POST { illustro_prompt, width, height, model, seed }
+      const isIllustroPath =
+        url.pathname === '/api/illustro' ||
+        url.pathname.endsWith('/api/illustro') ||
+        url.pathname.includes('/api/illustro');
+      if (isIllustroPath || body.illustro_prompt) {
+        const prompt =
+          (body.illustro_prompt || body.prompt || url.searchParams.get('prompt') || '').trim();
+        if (!prompt) {
+          return new Response(JSON.stringify({ error: 'prompt manquant' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          });
+        }
+        const width = parseInt(body.width || url.searchParams.get('width') || '1024', 10) || 1024;
+        const height = parseInt(body.height || url.searchParams.get('height') || '1024', 10) || 1024;
+        const seed =
+          body.seed != null
+            ? body.seed
+            : url.searchParams.get('seed') || Math.floor(Math.random() * 1e9);
+        let model =
+          body.model || url.searchParams.get('model') || 'flux-2-flex';
+        const key = env.POLLINATIONS_API_KEY || env.POLLINATIONS_KEY || '';
+
+        // Sans clé → flux classique (gratuit / legacy)
+        if (!key && (model.startsWith('flux-2') || model.includes('flux-2'))) {
+          model = 'flux';
+        }
+
+        const qs =
+          'model=' +
+          encodeURIComponent(model) +
+          '&width=' +
+          width +
+          '&height=' +
+          height +
+          '&nologo=true&enhance=true&seed=' +
+          encodeURIComponent(String(seed)) +
+          (key ? '&key=' + encodeURIComponent(key) : '');
+
+        const targets = [
+          'https://gen.pollinations.ai/image/' + encodeURIComponent(prompt) + '?' + qs,
+          'https://image.pollinations.ai/prompt/' + encodeURIComponent(prompt) + '?' + qs.replace('&enhance=true', ''),
+        ];
+
+        let lastErr = null;
+        for (const target of targets) {
+          try {
+            const r = await fetch(target, {
+              headers: key
+                ? { Authorization: 'Bearer ' + key }
+                : {},
+            });
+            if (!r.ok) {
+              lastErr = 'HTTP ' + r.status + ' ' + (await r.text().catch(() => '')).slice(0, 200);
+              // Si flux-2 échoue, retenter en flux simple
+              if (model.startsWith('flux-2')) {
+                model = 'flux';
+                continue;
+              }
+              continue;
+            }
+            const contentType = r.headers.get('Content-Type') || 'image/jpeg';
+            return new Response(r.body, {
+              status: 200,
+              headers: {
+                'Content-Type': contentType,
+                'Cache-Control': 'public, max-age=3600',
+                'X-Elion-Image-Model': model,
+                ...corsHeaders,
+              },
+            });
+          } catch (e) {
+            lastErr = e.message || String(e);
+          }
+        }
+
+        // Dernier recours : rediriger vers URL publique flux (sans exposer de sk_)
+        const fallback =
+          'https://gen.pollinations.ai/image/' +
+          encodeURIComponent(prompt) +
+          '?model=flux&width=' +
+          width +
+          '&height=' +
+          height +
+          '&nologo=true&seed=' +
+          seed;
+        return Response.redirect(fallback, 302);
       }
 
       // ---------- Google OAuth ----------
@@ -211,7 +302,7 @@ export default {
         }
       }
 
-      // ---------- Pixazo LTX Video (Fluxion) ----------
+      // ---------- Pixazo LTX Video (Fluxion — remplace Pollinations/sk_) ----------
       if (body.pixazo_video_prompt) {
         const pxKey = env.PIXAZO_API_KEY || '';
         if (!pxKey) {
@@ -243,7 +334,7 @@ export default {
         });
       }
 
-      // ---------- Pixazo LTX Video (alias ltx_prompt) ----------
+      // ---------- Pixazo LTX Video (Fluxion vidéo — remplace Pollinations) ----------
       if (body.ltx_prompt) {
         const pxKey = env.PIXAZO_API_KEY || '';
         if (!pxKey) {
@@ -275,6 +366,7 @@ export default {
           headers: { 'Content-Type': 'application/json', ...corsHeaders },
         });
       }
+
 
       // ---------- Pixazo Tracks (Sonaria — musique) ----------
       if (body.pixazo_prompt) {
@@ -313,7 +405,7 @@ export default {
         });
       }
 
-      // ---------- Pixazo — poll statut ----------
+      // ---------- Pixazo — vérification du statut (soumission Tracks ou autre modèle) ----------
       if (body.pixazo_poll_id) {
         const pxKey = env.PIXAZO_API_KEY || '';
         if (!pxKey) {
@@ -332,7 +424,7 @@ export default {
         });
       }
 
-      // ---------- GET health (+ diag clés, sans valeurs) ----------
+            // ---------- GET health (+ diag clés, sans révéler les valeurs) ----------
       if (request.method !== 'POST') {
         const diag = {
           ok: true,
@@ -353,7 +445,7 @@ export default {
       }
 
       // ---------------------------------------------------------------
-      // GEMINI — vision / docs / Works
+      // GEMINI — vision / docs / Works (force_gemini). Appel direct API Google.
       // ---------------------------------------------------------------
       if (body.provider === 'gemini' || body.force_gemini || body.force_vision || body.has_image) {
         const keys = [env.GEMINI_API_KEY, env.GEMINI_API_KEY_2, env.GEMINI_KEY]
@@ -401,14 +493,14 @@ export default {
         }
 
         const modelsToTry = [];
-        const preferred = body.gemini_model || body.model || 'gemini-2.0-flash';
+        const preferred = body.gemini_model || body.model || 'gemini-2.5-flash';
         modelsToTry.push(preferred);
         for (const m of [
-          'gemini-2.5-flash'
-          'gemini-3.5-flash'
-          'gemini-3.7-flash'
-          'gemini-3.6-flash'
-          'gemini-2.0-flash'
+          'gemini-2.5-flash',
+          'gemini-3.5-flash',
+          'gemini-3.7-flash',
+          'gemini-3.6-flash',
+          'gemini-2.0-flash',
         ]) {
           if (!modelsToTry.includes(m)) modelsToTry.push(m);
         }
@@ -421,9 +513,7 @@ export default {
         }
         if (body.generationConfig) {
           const gc = Object.assign({}, body.generationConfig);
-          try {
-            delete gc.thinkingConfig;
-          } catch (e) {}
+          try { delete gc.thinkingConfig; } catch (e) {}
           geminiPayload.generationConfig = gc;
         }
 
@@ -479,7 +569,9 @@ export default {
       }
 
       // ---------------------------------------------------------------
-      // GROQ chat
+      // GROQ chat — format Gemini in → OpenAI → format Gemini out
+      // (utilisé pour le chat normal ET pour Works · réponse, avec un
+      // modèle de raisonnement comme qwen/qwen3.6-27b si demandé)
       // ---------------------------------------------------------------
       const groqKey = env.GROQ_API_KEY || '';
       if (!groqKey) {
@@ -512,7 +604,7 @@ export default {
           text = c.parts
             .map((p) => {
               if (p.text) return p.text;
-              if (p.inline_data || p.inlineData) return '[image/fichier joint]';
+              if (p.inline_data) return '[image/fichier joint]';
               return '';
             })
             .filter(Boolean)
@@ -528,6 +620,7 @@ export default {
         temperature: (body.generationConfig && body.generationConfig.temperature) || 0.7,
         max_tokens: (body.generationConfig && body.generationConfig.maxOutputTokens) || 2048,
       };
+      // Modèles de raisonnement (ex. qwen/qwen3.6-27b) : réflexion visible dans <think>
       if (body.reasoning_format) groqBody.reasoning_format = body.reasoning_format;
 
       const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {

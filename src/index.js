@@ -85,95 +85,103 @@ export default {
 
 
       // ---------- Illustro / Pollinations (Flux 2 — clé côté Worker) ----------
-      // GET  /api/illustro?prompt=...&width=1024&height=1024&model=flux-2-flex
-      // POST { illustro_prompt, width, height, model, seed }
+      // GET /api/illustro?prompt=...&width=1024&height=1024&model=flux-2-flex
       const isIllustroPath =
         url.pathname === '/api/illustro' ||
         url.pathname.endsWith('/api/illustro') ||
         url.pathname.includes('/api/illustro');
       if (isIllustroPath || body.illustro_prompt) {
-        const prompt =
-          (body.illustro_prompt || body.prompt || url.searchParams.get('prompt') || '').trim();
+        const prompt = String(
+          body.illustro_prompt || body.prompt || url.searchParams.get('prompt') || ''
+        ).trim();
         if (!prompt) {
           return new Response(JSON.stringify({ error: 'prompt manquant' }), {
             status: 400,
             headers: { 'Content-Type': 'application/json', ...corsHeaders },
           });
         }
-        const width = parseInt(body.width || url.searchParams.get('width') || '1024', 10) || 1024;
-        const height = parseInt(body.height || url.searchParams.get('height') || '1024', 10) || 1024;
-        const seed =
-          body.seed != null
-            ? body.seed
-            : url.searchParams.get('seed') || Math.floor(Math.random() * 1e9);
-        let model =
-          body.model || url.searchParams.get('model') || 'flux-2-flex';
-        const key = env.POLLINATIONS_API_KEY || env.POLLINATIONS_KEY || '';
 
-        // Sans clé → flux classique (gratuit / legacy)
-        if (!key && (model.startsWith('flux-2') || model.includes('flux-2'))) {
-          model = 'flux';
+        const width = Math.min(2048, Math.max(256, parseInt(body.width || url.searchParams.get('width') || '1024', 10) || 1024));
+        const height = Math.min(2048, Math.max(256, parseInt(body.height || url.searchParams.get('height') || '1024', 10) || 1024));
+        const seed = body.seed != null ? body.seed : (url.searchParams.get('seed') || Math.floor(Math.random() * 1e9));
+        const key = (env.POLLINATIONS_API_KEY || env.POLLINATIONS_KEY || '').trim();
+        let model = (body.model || url.searchParams.get('model') || (key ? 'flux-2-flex' : 'flux')).trim();
+
+        // Chaîne de modèles à essayer
+        const modelsToTry = [];
+        if (key) {
+          modelsToTry.push(model);
+          if (model !== 'flux-2-flex') modelsToTry.push('flux-2-flex');
+          if (model !== 'flux') modelsToTry.push('flux');
+        } else {
+          modelsToTry.push('flux');
+        }
+        // unique
+        const seen = new Set();
+        const queue = modelsToTry.filter((m) => {
+          if (seen.has(m)) return false;
+          seen.add(m);
+          return true;
+        });
+
+        function buildUrl(m, base) {
+          const qs =
+            'model=' + encodeURIComponent(m) +
+            '&width=' + width +
+            '&height=' + height +
+            '&nologo=true&seed=' + encodeURIComponent(String(seed)) +
+            (key ? '&key=' + encodeURIComponent(key) : '');
+          if (base === 'gen') {
+            return 'https://gen.pollinations.ai/image/' + encodeURIComponent(prompt) + '?' + qs + '&enhance=true';
+          }
+          return 'https://image.pollinations.ai/prompt/' + encodeURIComponent(prompt) + '?' + qs;
         }
 
-        const qs =
-          'model=' +
-          encodeURIComponent(model) +
-          '&width=' +
-          width +
-          '&height=' +
-          height +
-          '&nologo=true&enhance=true&seed=' +
-          encodeURIComponent(String(seed)) +
-          (key ? '&key=' + encodeURIComponent(key) : '');
-
-        const targets = [
-          'https://gen.pollinations.ai/image/' + encodeURIComponent(prompt) + '?' + qs,
-          'https://image.pollinations.ai/prompt/' + encodeURIComponent(prompt) + '?' + qs.replace('&enhance=true', ''),
-        ];
-
-        let lastErr = null;
-        for (const target of targets) {
-          try {
-            const r = await fetch(target, {
-              headers: key
-                ? { Authorization: 'Bearer ' + key }
-                : {},
-            });
-            if (!r.ok) {
-              lastErr = 'HTTP ' + r.status + ' ' + (await r.text().catch(() => '')).slice(0, 200);
-              // Si flux-2 échoue, retenter en flux simple
-              if (model.startsWith('flux-2')) {
-                model = 'flux';
+        let lastErr = '';
+        for (const m of queue) {
+          for (const base of ['gen', 'legacy']) {
+            const target = buildUrl(m, base);
+            try {
+              const headers = { Accept: 'image/*,*/*' };
+              if (key) headers['Authorization'] = 'Bearer ' + key;
+              const r = await fetch(target, { headers, redirect: 'follow' });
+              const ct = (r.headers.get('Content-Type') || '').toLowerCase();
+              if (!r.ok) {
+                lastErr = m + '@' + base + ' HTTP ' + r.status;
                 continue;
               }
-              continue;
+              // Éviter de renvoyer du JSON d'erreur comme image
+              if (ct.includes('application/json') || ct.includes('text/')) {
+                lastErr = m + '@' + base + ' not image: ' + ct;
+                continue;
+              }
+              return new Response(r.body, {
+                status: 200,
+                headers: {
+                  'Content-Type': ct || 'image/jpeg',
+                  'Cache-Control': 'public, max-age=3600',
+                  'X-Elion-Image-Model': m,
+                  'Access-Control-Expose-Headers': 'X-Elion-Image-Model',
+                  ...corsHeaders,
+                },
+              });
+            } catch (e) {
+              lastErr = (e && e.message) || String(e);
             }
-            const contentType = r.headers.get('Content-Type') || 'image/jpeg';
-            return new Response(r.body, {
-              status: 200,
-              headers: {
-                'Content-Type': contentType,
-                'Cache-Control': 'public, max-age=3600',
-                'X-Elion-Image-Model': model,
-                ...corsHeaders,
-              },
-            });
-          } catch (e) {
-            lastErr = e.message || String(e);
           }
         }
 
-        // Dernier recours : rediriger vers URL publique flux (sans exposer de sk_)
-        const fallback =
-          'https://gen.pollinations.ai/image/' +
-          encodeURIComponent(prompt) +
-          '?model=flux&width=' +
-          width +
-          '&height=' +
-          height +
-          '&nologo=true&seed=' +
-          seed;
-        return Response.redirect(fallback, 302);
+        return new Response(
+          JSON.stringify({
+            error: 'Illustro generation failed',
+            details: lastErr || 'unknown',
+            hasKey: !!key,
+          }),
+          {
+            status: 502,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          }
+        );
       }
 
       // ---------- Google OAuth ----------
@@ -348,17 +356,71 @@ export default {
             { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
           );
         }
+
+        // Durées LTX-2 valides : 6, 8, 10, 20 — on clamp
+        let duration = parseInt(body.ltx_duration, 10);
+        if (![6, 8, 10, 20].includes(duration)) {
+          duration = duration >= 10 ? 10 : duration >= 8 ? 8 : 6;
+        }
+        // 10s+ réservé Pro (flag client)
+        if (duration >= 10 && body.ltx_pro !== true && body.ltx_pro !== 'true') {
+          duration = 8;
+        }
+
+        const aspect = body.ltx_aspect || '16:9';
+        const quality = String(body.ltx_quality || '720p').toLowerCase();
+        // Map qualité UI → resolution API
+        let resolution = '1080p';
+        if (quality === '720p') resolution = '1080p'; // LTX-2 min souvent 1080p; 720p si supporté côté provider
+        if (quality === '1080p') resolution = '1080p';
+        if (quality === '2k' || quality === '1440p') resolution = '2k';
+
+        const generateAudio = body.ltx_sound !== false && body.ltx_sound !== 'false';
+        const prompt = String(body.ltx_prompt).slice(0, 4000);
+        const seed = body.ltx_seed || Math.floor(Math.random() * 1000000);
+
+        const headers = {
+          'Content-Type': 'application/json',
+          'Ocp-Apim-Subscription-Key': pxKey,
+        };
+
+        // 1) Essai LTX-2 (durée réelle)
+        try {
+          const r2 = await fetch('https://gateway.pixazo.ai/lightricks/v1/ltx/generate', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              model: 'ltx-2-fast',
+              prompt,
+              duration,
+              resolution,
+              generate_audio: generateAudio,
+              aspect_ratio: aspect,
+              seed,
+            }),
+          });
+          const t2 = await r2.text();
+          if (r2.ok) {
+            return new Response(t2, {
+              status: 200,
+              headers: { 'Content-Type': 'application/json', ...corsHeaders },
+            });
+          }
+          // si 404/route inconnue → fallback ci-dessous
+        } catch (eLtx2) {}
+
+        // 2) Fallback endpoint historique (+ duration si accepté)
         const r = await fetch('https://gateway.pixazo.ai/ltx-video/v1/text-to-video', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Ocp-Apim-Subscription-Key': pxKey,
-          },
+          headers,
           body: JSON.stringify({
-            prompt: String(body.ltx_prompt).slice(0, 4000),
-            seed: body.ltx_seed || Math.floor(Math.random() * 1000000),
-            aspect: body.ltx_aspect || '16:9',
+            prompt,
+            seed,
+            aspect,
             enhance_prompt: true,
+            duration,
+            resolution,
+            generate_audio: generateAudio,
           }),
         });
         return new Response(await r.text(), {
@@ -461,7 +523,7 @@ export default {
             }),
             {
               status: 500,
-              headers: { 'Content-Type': 'application/json', ...corsHeaders },
+              heade{ 'Content-Type': 'application/json', ...corsHeaders },
             }
           );
         }
@@ -620,7 +682,7 @@ export default {
         temperature: (body.generationConfig && body.generationConfig.temperature) || 0.7,
         max_tokens: (body.generationConfig && body.generationConfig.maxOutputTokens) || 2048,
       };
-      // Modèles de raisonnement (ex. qwen/qwen3.6-27b) : réflexion visible dans <think>
+// Modèles de raisonnement (ex. qwen/qwen3.6-27b) : réflexion visible dans <think>
       if (body.reasoning_format) groqBody.reasoning_format = body.reasoning_format;
 
       const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {

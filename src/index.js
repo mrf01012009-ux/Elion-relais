@@ -84,6 +84,94 @@ export default {
       }
 
 
+
+
+      // ---------- Linear OAuth ----------
+      if (body.linear_oauth && body.code) {
+        const clientId = body.client_id || env.LINEAR_CLIENT_ID || '';
+        const clientSecret = env.LINEAR_CLIENT_SECRET || '';
+        if (!clientId || !clientSecret) {
+          return new Response(JSON.stringify({ error: 'LINEAR_CLIENT_ID/SECRET manquants' }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          });
+        }
+        const tokenRes = await fetch('https://api.linear.app/oauth/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            code: body.code,
+            redirect_uri: body.redirect_uri || '',
+            client_id: clientId,
+            client_secret: clientSecret,
+            grant_type: 'authorization_code',
+          }).toString(),
+        });
+        const tokenJson = await tokenRes.text();
+        return new Response(tokenJson, {
+          status: tokenRes.status,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+
+      // ---------- GitHub OAuth (échange code → token) ----------
+      if (body.github_oauth && body.code) {
+        const clientId = body.client_id || env.GITHUB_CLIENT_ID || '';
+        const clientSecret = env.GITHUB_CLIENT_SECRET || '';
+        if (!clientId || !clientSecret) {
+          return new Response(
+            JSON.stringify({
+              error: 'GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET manquants dans le Worker',
+            }),
+            { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
+          );
+        }
+        const redirectUri = body.redirect_uri || '';
+        const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({
+            client_id: clientId,
+            client_secret: clientSecret,
+            code: body.code,
+            redirect_uri: redirectUri,
+          }),
+        });
+        const tokenJson = await tokenRes.json().catch(() => ({}));
+        if (!tokenRes.ok || tokenJson.error) {
+          return new Response(JSON.stringify(tokenJson || { error: 'github token failed' }), {
+            status: tokenRes.status || 502,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          });
+        }
+        // Profil user
+        let user = null;
+        try {
+          const uRes = await fetch('https://api.github.com/user', {
+            headers: {
+              Authorization: 'Bearer ' + tokenJson.access_token,
+              Accept: 'application/vnd.github+json',
+              'User-Agent': 'ElionAI',
+            },
+          });
+          if (uRes.ok) user = await uRes.json();
+        } catch (eU) {}
+        return new Response(
+          JSON.stringify({
+            access_token: tokenJson.access_token,
+            token_type: tokenJson.token_type,
+            scope: tokenJson.scope,
+            user: user
+              ? { login: user.login, id: user.id, name: user.name, avatar_url: user.avatar_url }
+              : null,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
+        );
+      }
+
       // ---------- Illustro / Pollinations (Flux 2 — clé côté Worker) ----------
       // GET /api/illustro?prompt=...&width=1024&height=1024&model=flux-2-flex
       const isIllustroPath =
@@ -310,39 +398,7 @@ export default {
         }
       }
 
-      // ---------- Pixazo LTX Video (Fluxion — remplace Pollinations/sk_) ----------
-      if (body.pixazo_video_prompt) {
-        const pxKey = env.PIXAZO_API_KEY || '';
-        if (!pxKey) {
-          return new Response(
-            JSON.stringify({
-              error: {
-                message:
-                  'PIXAZO_API_KEY manquante. Cree une cle gratuite sur https://www.pixazo.ai',
-              },
-            }),
-            { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
-          );
-        }
-        const r = await fetch('https://gateway.pixazo.ai/ltx-video/v1/text-to-video', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Ocp-Apim-Subscription-Key': pxKey,
-          },
-          body: JSON.stringify({
-            prompt: String(body.pixazo_video_prompt).slice(0, 4000),
-            aspect: body.pixazo_video_aspect || '16:9',
-            enhance_prompt: true,
-          }),
-        });
-        return new Response(await r.text(), {
-          status: r.status,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders },
-        });
-      }
-
-      // ---------- Pixazo LTX Video (Fluxion vidéo — remplace Pollinations) ----------
+      // ---------- Pixazo LTX Video (Fluxion — durée réelle 6/8/10s) ----------
       if (body.ltx_prompt) {
         const pxKey = env.PIXAZO_API_KEY || '';
         if (!pxKey) {
@@ -357,78 +413,160 @@ export default {
           );
         }
 
-        // Durées LTX-2 valides : 6, 8, 10, 20 — on clamp
+        // Durées strictes LTX-2
         let duration = parseInt(body.ltx_duration, 10);
-        if (![6, 8, 10, 20].includes(duration)) {
+        if (![6, 8, 10, 12, 14, 16, 18, 20].includes(duration)) {
           duration = duration >= 10 ? 10 : duration >= 8 ? 8 : 6;
         }
-        // 10s+ réservé Pro (flag client)
+        // 10s+ réservé Pro
         if (duration >= 10 && body.ltx_pro !== true && body.ltx_pro !== 'true') {
           duration = 8;
         }
 
-        const aspect = body.ltx_aspect || '16:9';
         const quality = String(body.ltx_quality || '720p').toLowerCase();
-        // Map qualité UI → resolution API
+        // LTX-2-fast : 1080p / 1440p / 2160p (pas de 720p officiel)
         let resolution = '1080p';
-        if (quality === '720p') resolution = '1080p'; // LTX-2 min souvent 1080p; 720p si supporté côté provider
-        if (quality === '1080p') resolution = '1080p';
-        if (quality === '2k' || quality === '1440p') resolution = '2k';
+        if (quality === '1080p' || quality === '720p') resolution = '1080p';
+        if (quality === '2k' || quality === '1440p') resolution = '1440p';
+        if (quality === '4k' || quality === '2160p') resolution = '2160p';
+
+        // Aspects supportés souvent 16:9 / 9:16
+        let aspect = String(body.ltx_aspect || '16:9');
+        const aspectMap = {
+          '16:9': '16:9',
+          '9:16': '9:16',
+          '1:1': '16:9',
+          '2:3': '9:16',
+          '3:2': '16:9',
+          '4:3': '16:9',
+          '3:4': '9:16',
+        };
+        aspect = aspectMap[aspect] || '16:9';
 
         const generateAudio = body.ltx_sound !== false && body.ltx_sound !== 'false';
         const prompt = String(body.ltx_prompt).slice(0, 4000);
         const seed = body.ltx_seed || Math.floor(Math.random() * 1000000);
-
         const headers = {
           'Content-Type': 'application/json',
           'Ocp-Apim-Subscription-Key': pxKey,
         };
 
-        // 1) Essai LTX-2 (durée réelle)
-        try {
-          const r2 = await fetch('https://gateway.pixazo.ai/lightricks/v1/ltx/generate', {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
+        const payloadFast = {
+          prompt,
+          duration,
+          resolution,
+          generate_audio: generateAudio,
+          fps: 25,
+        };
+        // certains endpoints acceptent aspect_ratio
+        payloadFast.aspect_ratio = aspect;
+
+        const attempts = [
+          {
+            name: 'ltx-2-fast',
+            url: 'https://gateway.pixazo.ai/ltx-2-fast/v1/text-to-video',
+            body: payloadFast,
+          },
+          {
+            name: 'ltx-2-5-lite',
+            url: 'https://gateway.pixazo.ai/ltx-2-5-lite/v1/text-to-video',
+            body: {
+              prompt,
+              duration,
+              resolution: resolution === '2160p' ? '1080p' : resolution,
+              generate_audio: generateAudio,
+            },
+          },
+          {
+            name: 'lightricks-ltx',
+            url: 'https://gateway.pixazo.ai/lightricks/v1/ltx/generate',
+            body: {
               model: 'ltx-2-fast',
               prompt,
               duration,
-              resolution,
+              resolution: resolution === '1440p' ? '2k' : resolution === '2160p' ? '4k' : '1080p',
               generate_audio: generateAudio,
-              aspect_ratio: aspect,
+            },
+          },
+          {
+            name: 'ltx-video-legacy',
+            url: 'https://gateway.pixazo.ai/ltx-video/v1/text-to-video',
+            body: {
+              prompt,
               seed,
-            }),
-          });
-          const t2 = await r2.text();
-          if (r2.ok) {
-            return new Response(t2, {
-              status: 200,
-              headers: { 'Content-Type': 'application/json', ...corsHeaders },
+              aspect,
+              enhance_prompt: true,
+            },
+          },
+        ];
+
+        let lastErr = '';
+        for (const attempt of attempts) {
+          try {
+            const r = await fetch(attempt.url, {
+              method: 'POST',
+              headers,
+              body: JSON.stringify(attempt.body),
             });
+            const text = await r.text();
+            let json = {};
+            try {
+              json = JSON.parse(text);
+            } catch (e) {
+              lastErr = attempt.name + ' non-json ' + r.status;
+              continue;
+            }
+            if (!r.ok) {
+              lastErr =
+                attempt.name +
+                ' HTTP ' +
+                r.status +
+                ' ' +
+                (json.error || json.message || text).toString().slice(0, 200);
+              continue;
+            }
+
+            // Normalise request_id (certaines APIs renvoient id / requestId)
+            const rid =
+              json.request_id ||
+              json.requestId ||
+              json.id ||
+              (json.data && (json.data.request_id || json.data.id)) ||
+              null;
+
+            if (!rid && !json.output && !json.video_url) {
+              lastErr = attempt.name + ' sans request_id: ' + text.slice(0, 200);
+              continue;}
+
+            return new Response(
+              JSON.stringify({
+                ...json,
+                request_id: rid || json.request_id,
+                elion_model: attempt.name,
+                elion_duration: duration,
+                elion_resolution: resolution,
+                elion_aspect: aspect,
+              }),
+              {
+                status: 200,
+                headers: { 'Content-Type': 'application/json', ...corsHeaders },
+              }
+            );
+          } catch (e) {
+            lastErr = attempt.name + ' ' + (e.message || String(e));
           }
-          // si 404/route inconnue → fallback ci-dessous
-        } catch (eLtx2) {}
+        }
 
-        // 2) Fallback endpoint historique (+ duration si accepté)
-        const r = await fetch('https://gateway.pixazo.ai/ltx-video/v1/text-to-video', {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({
-            prompt,
-            seed,
-            aspect,
-            enhance_prompt: true,
-            duration,
-            resolution,
-            generate_audio: generateAudio,
+        return new Response(
+          JSON.stringify({
+            error: {
+              message: 'Fluxion: aucun endpoint LTX n’a accepté la requête',
+              details: lastErr,
+            },
           }),
-        });
-        return new Response(await r.text(), {
-          status: r.status,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders },
-        });
+          { status: 502, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
+        );
       }
-
 
       // ---------- Pixazo Tracks (Sonaria — musique) ----------
       if (body.pixazo_prompt) {
@@ -523,7 +661,7 @@ export default {
             }),
             {
               status: 500,
-              heade{ 'Content-Type': 'application/json', ...corsHeaders },
+              headers: { 'Content-Type': 'application/json', ...corsHeaders },
             }
           );
         }
@@ -586,8 +724,7 @@ export default {
             const geminiUrl =
               'https://generativelanguage.googleapis.com/v1beta/models/' +
               encodeURIComponent(geminiModel) +
-              ':generateContent?key=' +
-              encodeURIComponent(geminiKey);
+encodeURIComponent(geminiKey);
             try {
               const gRes = await fetch(geminiUrl, {
                 method: 'POST',
@@ -682,7 +819,7 @@ export default {
         temperature: (body.generationConfig && body.generationConfig.temperature) || 0.7,
         max_tokens: (body.generationConfig && body.generationConfig.maxOutputTokens) || 2048,
       };
-// Modèles de raisonnement (ex. qwen/qwen3.6-27b) : réflexion visible dans <think>
+      // Modèles de raisonnement (ex. qwen/qwen3.6-27b) : réflexion visible dans <think>
       if (body.reasoning_format) groqBody.reasoning_format = body.reasoning_format;
 
       const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {

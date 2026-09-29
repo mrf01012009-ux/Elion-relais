@@ -891,13 +891,40 @@ encodeURIComponent(geminiKey);
       return new Response(
         JSON.stringify({ error: 'Erreur relais', details: err.message }),
         {
-          status: 500,
-          headers: {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-          },
-        }
-      );
+       // --- TTS (voix FR via Google Translate TTS, proxy Worker) ---
+if (request.method === 'POST') {
+  let body = {};
+  try { body = await request.json(); } catch (e) {}
+  const url = new URL(request.url);
+
+  if (url.pathname.endsWith('/tts') || body.action === 'tts') {
+    const text = String(body.text || '').slice(0, 180);
+    const lang = body.lang || 'fr';
+    if (!text) {
+      return new Response('Missing text', { status: 400 });
     }
-  },
-};
+    const ttsUrl =
+      'https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=' +
+      encodeURIComponent(lang) +
+      '&q=' +
+      encodeURIComponent(text);
+    const r = await fetch(ttsUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://translate.google.com/',
+      },
+    });
+    if (!r.ok) {
+      return new Response('TTS upstream error', { status: 502 });
+    }
+    const audio = await r.arrayBuffer();
+    return new Response(audio, {
+      headers: {
+        'Content-Type': 'audio/mpeg',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-store',
+      },
+    });
+  }
+}

@@ -1,16 +1,11 @@
 /**
- * ElionAI Relay — Cloudflare Worker (fusionné)
- * Routes : Fluxion LTX, Sonaria Pixazo, Gemini, Pexels, Tavily, TTS, OAuth
- *
- * Variables / Secrets Cloudflare :
+ * ElionAI Relay — Cloudflare Worker (fusionné + Groq)
+ * Variables :
  *   PIXAZO_API_KEY
- *   GEMINI_API_KEY          (vision / chat relay)
- *   TAVILY_API_KEY          (optionnel)
- *   PEXELS_API_KEY          (optionnel)
- *   DISCORD_CLIENT_ID / DISCORD_CLIENT_SECRET (optionnel)
- *   GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET (optionnel)
- *   LINEAR_CLIENT_ID / LINEAR_CLIENT_SECRET (optionnel)
- *   TURNSTILE_SECRET_KEY    (optionnel)
+ *   GROQ_API_KEY            (chat normal)  ← OBLIGATOIRE
+ *   GEMINI_API_KEY          (vision / Works)
+ *   TAVILY_API_KEY, PEXELS_API_KEY (optionnel)
+ *   DISCORD_ / GITHUB_ / LINEAR_ / TURNSTILE_ (optionnel)
  */
 
 const CORS = {
@@ -27,7 +22,6 @@ const LTX_SUBMIT = [
 ];
 const LTX_STATUS = 'https://gateway.pixazo.ai/v2/requests/status/';
 
-// Sonaria / audio Pixazo (adapte si ton endpoint musique est différent)
 const SONARIA_SUBMIT = [
   'https://gateway.pixazo.ai/stable-audio/v1/text-to-audio',
   'https://gateway.pixazo.ai/stable-audio-open/v1/text-to-audio',
@@ -59,7 +53,6 @@ function mapResolution(q) {
 async function submitLtx(body, env) {
   const key = env.PIXAZO_API_KEY;
   if (!key) return json({ error: 'PIXAZO_API_KEY manquante' }, 500);
-
   const prompt = String(body.ltx_prompt || '').trim();
   if (!prompt) return json({ error: 'ltx_prompt manquant' }, 400);
 
@@ -131,36 +124,23 @@ async function statusLtx(body, env) {
   else if (out.url) videoUrl = out.url;
   videoUrl = videoUrl || data.video_url || data.url || (data.result && data.result.video_url) || null;
 
-  return json({
-    request_id: id,
-    status: data.status || 'UNKNOWN',
-    video_url: videoUrl,
-    url: videoUrl,
-    data,
-  });
+  return json({ request_id: id, status: data.status || 'UNKNOWN', video_url: videoUrl, url: videoUrl, data });
 }
 
-/* ---------- Sonaria (Pixazo audio) ---------- */
+/* ---------- Sonaria ---------- */
 async function submitSonaria(body, env) {
   const key = env.PIXAZO_API_KEY;
   if (!key) return json({ error: 'PIXAZO_API_KEY manquante' }, 500);
   const prompt = String(body.pixazo_prompt || '').trim();
   if (!prompt) return json({ error: 'pixazo_prompt manquant' }, 400);
 
-  const payload = {
-    prompt,
-    duration: Number(body.pixazo_duration) || 35,
-  };
-
+  const payload = { prompt, duration: Number(body.pixazo_duration) || 35 };
   const errors = [];
   for (const url of SONARIA_SUBMIT) {
     try {
       const res = await fetch(url, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Ocp-Apim-Subscription-Key': key,
-        },
+        headers: { 'Content-Type': 'application/json', 'Ocp-Apim-Subscription-Key': key },
         body: JSON.stringify(payload),
       });
       const data = await res.json().catch(() => ({}));
@@ -204,23 +184,21 @@ async function pollSonaria(body, env) {
   });
 }
 
-/* ---------- Gemini relay (vision / chat) ---------- */
+/* ---------- Gemini ---------- */
 async function relayGemini(body, env) {
   const key = env.GEMINI_API_KEY;
   if (!key) return json({ error: 'GEMINI_API_KEY manquante sur le Worker' }, 500);
 
-  const model =
-    body.gemini_model || body.model || 'gemini-2.5-flash';
+  const model = body.gemini_model || body.model || 'gemini-3.8-flash';
   const url =
     'https://generativelanguage.googleapis.com/v1beta/models/' +
     encodeURIComponent(model) +
     ':generateContent?key=' +
     encodeURIComponent(key);
 
-  const payload = {
-    contents: body.contents || body.messages || [],
-  };
+  const payload = { contents: body.contents || body.messages || [] };
   if (body.systemInstruction) payload.systemInstruction = body.systemInstruction;
+  if (body.system_instruction) payload.systemInstruction = body.system_instruction;
   if (body.generationConfig) payload.generationConfig = body.generationConfig;
   if (body.tools) payload.tools = body.tools;
   if (body.safetySettings) payload.safetySettings = body.safetySettings;
@@ -231,26 +209,91 @@ async function relayGemini(body, env) {
     body: JSON.stringify(payload),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    return json({ error: data.error || data, status: res.status }, res.status);
-  }
+  if (!res.ok) return json({ error: data.error || data, status: res.status }, res.status);
   return json(data);
 }
 
-/* ---------- Pexels ---------- */
+/* ---------- Groq (chat) ---------- */
+function geminiContentsToOpenAIMessages(body) {
+  const messages = [];
+  const sysParts =
+    (body.system_instruction && body.system_instruction.parts) ||
+    (body.systemInstruction && body.systemInstruction.parts) ||
+    [];
+  const sys = sysParts.map((p) => p.text || '').filter(Boolean).join('\n') || body.system || '';
+  if (sys) messages.push({ role: 'system', content: sys });
+
+  for (const c of body.contents || []) {
+    const role = c.role === 'model' ? 'assistant' : 'user';
+    let text = '';
+    for (const p of c.parts || []) {
+      if (typeof p.text === 'string') text += p.text;
+    }
+    if (text.trim()) messages.push({ role, content: text });
+  }
+
+  if (Array.isArray(body.messages) && body.messages.length) {
+    if (!messages.length || (messages.length === 1 && messages[0].role === 'system')) {
+      return body.messages;
+    }
+  }
+  return messages;
+}
+
+async function relayGroq(body, env) {
+  const key = env.GROQ_API_KEY;
+  if (!key) return json({ error: 'GROQ_API_KEY manquante sur le Worker' }, 500);
+
+  const model = body.groq_model || body.model || 'openai/gpt-oss-120b';
+  const messages = geminiContentsToOpenAIMessages(body);
+  if (!messages.length) return json({ error: 'Aucun message à envoyer à Groq' }, 400);
+
+  const payload = {
+    model,
+    messages,
+    temperature:
+      body.generationConfig && body.generationConfig.temperature != null
+        ? body.generationConfig.temperature
+        : 0.7,
+    max_tokens: (body.generationConfig && body.generationConfig.maxOutputTokens) || 8192,
+  };
+  if (body.reasoning_format) payload.reasoning_format = body.reasoning_format;
+
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer ' + key,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    return json({ error: data.error || data, status: res.status }, res.status >= 400 ? res.status : 502);
+  }
+
+  const text =
+    (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+
+  return json({
+    candidates: [{ content: { role: 'model', parts: [{ text }] } }],
+    groq: data,
+  });
+}
+
+/* ---------- Pexels / Tavily / TTS / Auth ---------- */
 async function pexels(body, env) {
   const key = env.PEXELS_API_KEY;
   if (!key) return json({ photos: [], error: 'PEXELS_API_KEY manquante' }, 200);
   const q = encodeURIComponent(String(body.pexels_query || '').slice(0, 80));
-  const res = await fetch(
-    'https://api.pexels.com/v1/search?query=' + q + '&per_page=8',
-    { headers: { Authorization: key } }
-  );
+  const res = await fetch('https://api.pexels.com/v1/search?query=' + q + '&per_page=8', {
+    headers: { Authorization: key },
+  });
   const data = await res.json().catch(() => ({ photos: [] }));
   return json(data, res.ok ? 200 : res.status);
 }
 
-/* ---------- Tavily ---------- */
 async function tavily(body, env) {
   const key = env.TAVILY_API_KEY;
   if (!key) return json({ text: '', results: [], error: 'TAVILY_API_KEY manquante' }, 200);
@@ -265,17 +308,9 @@ async function tavily(body, env) {
     }),
   });
   const data = await res.json().catch(() => ({}));
-  return json(
-    {
-      text: data.answer || '',
-      results: data.results || [],
-      ...data,
-    },
-    res.ok ? 200 : res.status
-  );
+  return json({ text: data.answer || '', results: data.results || [], ...data }, res.ok ? 200 : res.status);
 }
 
-/* ---------- TTS (proxy Google Translate TTS) ---------- */
 async function handleTts(body) {
   const text = String(body.text || '').slice(0, 180);
   const lang = body.lang || 'fr';
@@ -292,26 +327,17 @@ async function handleTts(body) {
       Referer: 'https://translate.google.com/',
     },
   });
-  if (!r.ok) {
-    return new Response('TTS upstream error', { status: 502, headers: CORS });
-  }
+  if (!r.ok) return new Response('TTS upstream error', { status: 502, headers: CORS });
   const audio = await r.arrayBuffer();
   return new Response(audio, {
-    headers: {
-      'Content-Type': 'audio/mpeg',
-      'Cache-Control': 'no-store',
-      ...CORS,
-    },
+    headers: { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store', ...CORS },
   });
 }
 
-/* ---------- Auth helpers ---------- */
 async function authDiscord(body, env) {
   const clientId = env.DISCORD_CLIENT_ID;
   const clientSecret = env.DISCORD_CLIENT_SECRET;
-  if (!clientId || !clientSecret) {
-    return json({ error: 'Discord non configuré sur le Worker' }, 500);
-  }
+  if (!clientId || !clientSecret) return json({ error: 'Discord non configuré sur le Worker' }, 500);
   const params = new URLSearchParams({
     client_id: clientId,
     client_secret: clientSecret,
@@ -330,14 +356,11 @@ async function authDiscord(body, env) {
 
 async function authTurnstile(body, env) {
   const secret = env.TURNSTILE_SECRET_KEY;
-  if (!secret) return json({ success: true, skipped: true }); // dev-friendly
+  if (!secret) return json({ success: true, skipped: true });
   const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      secret,
-      response: body.token || body.response || '',
-    }),
+    body: new URLSearchParams({ secret, response: body.token || body.response || '' }),
   });
   const data = await res.json().catch(() => ({ success: false }));
   return json(data);
@@ -395,15 +418,12 @@ export default {
         ok: true,
         service: 'Elion relay',
         fluxion: 'pixazo-ltx-2.5',
-        routes: ['ltx_prompt', 'ltx_status', 'pixazo_prompt', 'pixazo_poll_id', 'gemini', 'tts', 'auth/*'],
+        routes: ['ltx_prompt', 'ltx_status', 'pixazo_prompt', 'pixazo_poll_id', 'groq', 'gemini', 'tts', 'auth/*'],
       });
     }
 
-    if (request.method !== 'POST') {
-      return json({ error: 'POST only' }, 405);
-    }
+    if (request.method !== 'POST') return json({ error: 'POST only' }, 405);
 
-    // Path-based
     if (path.endsWith('/tts')) {
       let body = {};
       try { body = await request.json(); } catch (_) {}
@@ -427,7 +447,6 @@ export default {
       return json({ error: 'JSON invalide' }, 400);
     }
 
-    // Body-based routing
     if (body.ltx_prompt != null) return submitLtx(body, env);
     if (body.ltx_status) return statusLtx(body, env);
     if (body.pixazo_prompt != null) return submitSonaria(body, env);
@@ -438,7 +457,20 @@ export default {
     if (body.linear_oauth) return authLinear(body, env);
     if (body.action === 'tts') return handleTts(body);
 
-    // Gemini : contents / force_vision / force_gemini
+    // ★ Groq AVANT Gemini
+    const wantGroq =
+      body.provider === 'groq' ||
+      !!body.groq_model ||
+      (typeof body.model === 'string' &&
+        (body.model.includes('gpt-oss') ||
+          body.model.includes('qwen') ||
+          body.model.includes('llama') ||
+          body.model.includes('groq')));
+
+    if (wantGroq && !body.force_gemini && !body.force_vision && !body.has_image) {
+      return relayGroq(body, env);
+    }
+
     if (
       body.contents ||
       body.force_gemini ||
@@ -449,9 +481,6 @@ export default {
       return relayGemini(body, env);
     }
 
-    return json({
-      error: 'Route inconnue',
-      received_keys: Object.keys(body),
-    }, 400);
+    return json({ error: 'Route inconnue', received_keys: Object.keys(body) }, 400);
   },
 };

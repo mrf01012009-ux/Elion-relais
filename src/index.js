@@ -1,9 +1,10 @@
 /**
- * ElionAI Relay — Cloudflare Worker (fusionné + Groq)
+ * ElionAI Relay — Cloudflare Worker
  * Variables :
- *   PIXAZO_API_KEY
- *   GROQ_API_KEY            (chat normal)  ← OBLIGATOIRE
- *   GEMINI_API_KEY          (vision / Works)
+ *   INFERENCEPORT_API_KEY  (Fluxion principal — wan-fast / pixverse-v5)
+ *   PIXAZO_API_KEY         (Fluxion fallback LTX + Sonaria)
+ *   GROQ_API_KEY
+ *   GEMINI_API_KEY
  *   TAVILY_API_KEY, PEXELS_API_KEY (optionnel)
  *   DISCORD_ / GITHUB_ / LINEAR_ / TURNSTILE_ (optionnel)
  */
@@ -13,6 +14,9 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
+
+const IP_BASE = 'https://sharktide-lightning.hf.space';
+const FLUXION_MODELS = new Set(['wan-fast', 'pixverse-v5']);
 
 const LTX_SUBMIT = [
   'https://gateway.pixazo.ai/ltx-2-5-pro/v1/text-to-video',
@@ -35,10 +39,10 @@ function json(data, status = 200) {
 }
 
 function mapDuration(d) {
-  const n = Number(d) || 6;
-  if (n <= 6) return 6;
-  if (n <= 8) return 8;
-  return 10;
+  const n = Number(d) || 5;
+  if (n < 3) return 3;
+  if (n > 8) return 8;
+  return Math.round(n);
 }
 
 function mapResolution(q) {
@@ -49,7 +53,93 @@ function mapResolution(q) {
   return '720p';
 }
 
-/* ---------- Fluxion LTX ---------- */
+function ipHeaders(env) {
+  return {
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+    'User-Agent': 'ElionAI-Fluxion/1.0',
+    Authorization: 'Bearer ' + env.INFERENCEPORT_API_KEY,
+  };
+}
+
+/* ---------- Fluxion InferencePort (principal) ---------- */
+async function submitInferencePort(body, env) {
+  if (!env.INFERENCEPORT_API_KEY) return null;
+  const prompt = String(body.ltx_prompt || body.prompt || '').trim();
+  if (!prompt) return null;
+
+  let model = String(body.ltx_model || body.model || 'wan-fast').toLowerCase();
+  if (!FLUXION_MODELS.has(model)) model = 'wan-fast';
+  const duration = mapDuration(body.ltx_duration || body.duration);
+
+  try {
+    const res = await fetch(IP_BASE + '/gen/videos', {
+      method: 'POST',
+      headers: ipHeaders(env),
+      body: JSON.stringify({
+        model,
+        prompt: prompt.slice(0, 800),
+        duration,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    const id = data.id || data.job_id || data.task_id;
+    if ((res.ok || res.status === 202) && id) {
+      return json({
+        request_id: id,
+        status: data.status || 'QUEUED',
+        provider: 'inferenceport',
+        model,
+        polling_url: IP_BASE + '/gen/videos/' + id,
+      });
+    }
+    return { _fail: true, status: res.status, data };
+  } catch (e) {
+    return { _fail: true, error: String(e.message || e) };
+  }
+}
+
+async function statusInferencePort(id, env) {
+  const res = await fetch(IP_BASE + '/gen/videos/' + encodeURIComponent(id), {
+    headers: ipHeaders(env),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    return json(
+      { error: data.detail || data.error || data.message || 'Status InferencePort échoué', status: 'ERROR', raw: data },
+      res.status >= 400 ? res.status : 502
+    );
+  }
+
+  const st = String(data.status || data.state || '').toLowerCase();
+  let videoUrl =
+    data.url ||
+    data.video_url ||
+    data.content_url ||
+    (data.output && (data.output.url || data.output.video_url)) ||
+    (Array.isArray(data.output?.urls) && data.output.urls[0]) ||
+    null;
+
+  if ((st === 'completed' || st === 'succeeded' || st === 'success') && !videoUrl) {
+    videoUrl = IP_BASE + '/gen/videos/' + encodeURIComponent(id) + '/content';
+  }
+
+  let status = data.status || 'UNKNOWN';
+  if (st === 'completed' || st === 'succeeded' || st === 'success') status = 'COMPLETED';
+  else if (st === 'failed' || st === 'error') status = 'FAILED';
+  else if (st === 'pending' || st === 'queued' || st === 'processing' || st === 'running') status = 'PROCESSING';
+
+  return json({
+    request_id: id,
+    status,
+    video_url: videoUrl,
+    url: videoUrl,
+    provider: 'inferenceport',
+    data,
+  });
+}
+
+/* ---------- Fluxion LTX Pixazo (fallback) ---------- */
 async function submitLtx(body, env) {
   const key = env.PIXAZO_API_KEY;
   if (!key) return json({ error: 'PIXAZO_API_KEY manquante' }, 500);
@@ -89,6 +179,7 @@ async function submitLtx(body, env) {
         return json({
           request_id: requestId,
           status: data.status || 'QUEUED',
+          provider: 'pixazo-ltx',
           polling_url: data.polling_url || LTX_STATUS + requestId,
           endpoint: url,
         });
@@ -124,7 +215,35 @@ async function statusLtx(body, env) {
   else if (out.url) videoUrl = out.url;
   videoUrl = videoUrl || data.video_url || data.url || (data.result && data.result.video_url) || null;
 
-  return json({ request_id: id, status: data.status || 'UNKNOWN', video_url: videoUrl, url: videoUrl, data });
+  return json({ request_id: id, status: data.status || 'UNKNOWN', video_url: videoUrl, url: videoUrl, provider: 'pixazo-ltx', data });
+}
+
+/* ---------- Submit / status unifiés Fluxion ---------- */
+async function submitFluxion(body, env) {
+  // 1) InferencePort d'abord
+  if (env.INFERENCEPORT_API_KEY) {
+    const ip = await submitInferencePort(body, env);
+    if (ip && !ip._fail) return ip; // Response déjà formée
+    // si échec, on tombe sur LTX
+  }
+  // 2) Fallback Pixazo LTX
+  if (env.PIXAZO_API_KEY) return submitLtx(body, env);
+  return json({ error: 'Aucune clé Fluxion (INFERENCEPORT_API_KEY ou PIXAZO_API_KEY)' }, 500);
+}
+
+async function statusFluxion(body, env) {
+  const id = String(body.ltx_status || body.request_id || '').trim();
+  if (!id) return json({ error: 'ltx_status manquant' }, 400);
+
+  // Heuristique : ids InferencePort souvent uuid-like ; on tente IP si clé présente
+  if (env.INFERENCEPORT_API_KEY && (body.provider === 'inferenceport' || id.includes('-') || body.force_ip)) {
+    try {
+      return await statusInferencePort(id, env);
+    } catch (_) {}
+  }
+  if (env.PIXAZO_API_KEY) return statusLtx(body, env);
+  if (env.INFERENCEPORT_API_KEY) return statusInferencePort(id, env);
+  return json({ error: 'Aucune clé pour poll Fluxion' }, 500);
 }
 
 /* ---------- Sonaria ---------- */
@@ -189,7 +308,7 @@ async function relayGemini(body, env) {
   const key = env.GEMINI_API_KEY;
   if (!key) return json({ error: 'GEMINI_API_KEY manquante sur le Worker' }, 500);
 
-  const model = body.gemini_model || body.model || 'gemini-3.8-flash';
+  const model = body.gemini_model || body.model || 'gemini-2.5-flash';
   const url =
     'https://generativelanguage.googleapis.com/v1beta/models/' +
     encodeURIComponent(model) +
@@ -213,7 +332,7 @@ async function relayGemini(body, env) {
   return json(data);
 }
 
-/* ---------- Groq (chat) ---------- */
+/* ---------- Groq ---------- */
 function geminiContentsToOpenAIMessages(body) {
   const messages = [];
   const sysParts =
@@ -417,7 +536,7 @@ export default {
       return json({
         ok: true,
         service: 'Elion relay',
-        fluxion: 'pixazo-ltx-2.5',
+        fluxion: env.INFERENCEPORT_API_KEY ? 'inferenceport+pixazo-fallback' : 'pixazo-ltx',
         routes: ['ltx_prompt', 'ltx_status', 'pixazo_prompt', 'pixazo_poll_id', 'groq', 'gemini', 'tts', 'auth/*'],
       });
     }
@@ -436,7 +555,7 @@ export default {
     }
     if (path.endsWith('/auth/turnstile')) {
       let body = {};
-      try { body = await request.json(); } catch (_) {}
+   try { body = await request.json(); } catch (_) {}
       return authTurnstile(body, env);
     }
 
@@ -447,8 +566,8 @@ export default {
       return json({ error: 'JSON invalide' }, 400);
     }
 
-    if (body.ltx_prompt != null) return submitLtx(body, env);
-    if (body.ltx_status) return statusLtx(body, env);
+    if (body.ltx_prompt != null) return submitFluxion(body, env);
+    if (body.ltx_status) return statusFluxion(body, env);
     if (body.pixazo_prompt != null) return submitSonaria(body, env);
     if (body.pixazo_poll_id) return pollSonaria(body, env);
     if (body.pexels_query != null) return pexels(body, env);
@@ -457,7 +576,6 @@ export default {
     if (body.linear_oauth) return authLinear(body, env);
     if (body.action === 'tts') return handleTts(body);
 
-    // ★ Groq AVANT Gemini
     const wantGroq =
       body.provider === 'groq' ||
       !!body.groq_model ||

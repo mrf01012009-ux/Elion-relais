@@ -1,7 +1,7 @@
 /**
  * ElionAI Relay — Cloudflare Worker
  * Variables :
- *   INFERENCEPORT_API_KEY  (Fluxion principal — wan-fast / pixverse-v5)
+ *   INFERENCEPORT_API_KEY  (Fluxion principal)
  *   PIXAZO_API_KEY         (Fluxion fallback LTX + Sonaria)
  *   GROQ_API_KEY
  *   GEMINI_API_KEY
@@ -62,7 +62,7 @@ function ipHeaders(env) {
   };
 }
 
-/* ---------- Fluxion InferencePort (principal) ---------- */
+/* ---------- Fluxion InferencePort ---------- */
 async function submitInferencePort(body, env) {
   if (!env.INFERENCEPORT_API_KEY) return null;
   const prompt = String(body.ltx_prompt || body.prompt || '').trim();
@@ -106,7 +106,11 @@ async function statusInferencePort(id, env) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     return json(
-      { error: data.detail || data.error || data.message || 'Status InferencePort échoué', status: 'ERROR', raw: data },
+      {
+        error: data.detail || data.error || data.message || 'Status InferencePort échoué',
+        status: 'ERROR',
+        raw: data,
+      },
       res.status >= 400 ? res.status : 502
     );
   }
@@ -117,7 +121,7 @@ async function statusInferencePort(id, env) {
     data.video_url ||
     data.content_url ||
     (data.output && (data.output.url || data.output.video_url)) ||
-    (Array.isArray(data.output?.urls) && data.output.urls[0]) ||
+    (Array.isArray(data.output && data.output.urls) && data.output.urls[0]) ||
     null;
 
   if ((st === 'completed' || st === 'succeeded' || st === 'success') && !videoUrl) {
@@ -173,7 +177,9 @@ async function submitLtx(body, env) {
       });
       const data = await res.json().catch(() => ({}));
       const requestId =
-        data.request_id || data.requestId || data.id ||
+        data.request_id ||
+        data.requestId ||
+        data.id ||
         (data.data && (data.data.request_id || data.data.id));
       if ((res.ok || res.status === 202) && requestId) {
         return json({
@@ -203,7 +209,10 @@ async function statusLtx(body, env) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    return json({ error: data.error || data.message || 'Status LTX échoué', status: data.status || 'ERROR', raw: data }, res.status >= 400 ? res.status : 502);
+    return json(
+      { error: data.error || data.message || 'Status LTX échoué', status: data.status || 'ERROR', raw: data },
+      res.status >= 400 ? res.status : 502
+    );
   }
 
   let videoUrl = null;
@@ -215,27 +224,44 @@ async function statusLtx(body, env) {
   else if (out.url) videoUrl = out.url;
   videoUrl = videoUrl || data.video_url || data.url || (data.result && data.result.video_url) || null;
 
-  return json({ request_id: id, status: data.status || 'UNKNOWN', video_url: videoUrl, url: videoUrl, provider: 'pixazo-ltx', data });
+  return json({
+    request_id: id,
+    status: data.status || 'UNKNOWN',
+    video_url: videoUrl,
+    url: videoUrl,
+    provider: 'pixazo-ltx',
+    data,
+  });
 }
 
-/* ---------- Submit / status unifiés Fluxion ---------- */
+/* ---------- Submit / status unifiés ---------- */
 async function submitFluxion(body, env) {
-  // 1) InferencePort d'abord
   if (env.INFERENCEPORT_API_KEY) {
     const ip = await submitInferencePort(body, env);
-    if (ip && !ip._fail) return ip; // Response déjà formée
-    // si échec, on tombe sur LTX
+    if (ip && !ip._fail) return ip;
+    const detail = (ip && (ip.data || ip.error)) || 'InferencePort a refusé la requête';
+    const st = (ip && ip.status) || 502;
+    return json(
+      {
+        error:
+          typeof detail === 'string'
+            ? detail
+            : detail.detail || detail.error || JSON.stringify(detail).slice(0, 300),
+        provider: 'inferenceport',
+        status: st,
+        hint: st === 401 ? 'Vérifie INFERENCEPORT_API_KEY' : 'Upstream Fluxion indisponible',
+      },
+      st >= 400 ? st : 502
+    );
   }
-  // 2) Fallback Pixazo LTX
   if (env.PIXAZO_API_KEY) return submitLtx(body, env);
-  return json({ error: 'Aucune clé Fluxion (INFERENCEPORT_API_KEY ou PIXAZO_API_KEY)' }, 500);
+  return json({ error: 'INFERENCEPORT_API_KEY manquante sur le Worker' }, 500);
 }
 
 async function statusFluxion(body, env) {
   const id = String(body.ltx_status || body.request_id || '').trim();
   if (!id) return json({ error: 'ltx_status manquant' }, 400);
 
-  // Heuristique : ids InferencePort souvent uuid-like ; on tente IP si clé présente
   if (env.INFERENCEPORT_API_KEY && (body.provider === 'inferenceport' || id.includes('-') || body.force_ip)) {
     try {
       return await statusInferencePort(id, env);
@@ -537,7 +563,9 @@ export default {
         ok: true,
         service: 'Elion relay',
         fluxion: env.INFERENCEPORT_API_KEY ? 'inferenceport+pixazo-fallback' : 'pixazo-ltx',
-        routes: ['ltx_prompt', 'ltx_status', 'pixazo_prompt', 'pixazo_poll_id', 'groq', 'gemini', 'tts', 'auth/*'],
+        has_ip_key: !!env.INFERENCEPORT_API_KEY,
+        key_len: env.INFERENCEPORT_API_KEY ? String(env.INFERENCEPORT_API_KEY).length : 0,
+        routes: ['ltx_prompt', 'ltx_status', 'pixazo_prompt', 'pixazo_poll_id', 'groq', 'gemini','tts', 'auth/*'],
       });
     }
 
@@ -545,17 +573,23 @@ export default {
 
     if (path.endsWith('/tts')) {
       let body = {};
-      try { body = await request.json(); } catch (_) {}
+      try {
+        body = await request.json();
+      } catch (_) {}
       return handleTts(body);
     }
     if (path.endsWith('/auth/discord')) {
       let body = {};
-      try { body = await request.json(); } catch (_) {}
+      try {
+        body = await request.json();
+      } catch (_) {}
       return authDiscord(body, env);
     }
     if (path.endsWith('/auth/turnstile')) {
       let body = {};
-   try { body = await request.json(); } catch (_) {}
+      try {
+        body = await request.json();
+      } catch (_) {}
       return authTurnstile(body, env);
     }
 
@@ -589,13 +623,7 @@ export default {
       return relayGroq(body, env);
     }
 
-    if (
-      body.contents ||
-      body.force_gemini ||
-      body.force_vision ||
-      body.has_image ||
-      body.gemini_model
-    ) {
+    if (body.contents || body.force_gemini || body.force_vision || body.has_image || body.gemini_model) {
       return relayGemini(body, env);
     }
 

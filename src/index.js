@@ -301,16 +301,15 @@ async function submitSonariaAce(body, env) {
   const duration = Math.max(10, Math.min(60, Number(body.ace_duration || body.pixazo_duration) || 30));
 
   const payload = {
-    model: 'acemusic/acestep-v15-turbo',
-    messages: [{ role: 'user', content: prompt.slice(0, 500) }],
-    sample_mode: true,
-    task_type: 'text2music',
-    audio_config: {
-      duration: duration,
-      instrumental: true,
-      format: 'mp3',
-    },
-  };
+  model: 'acemusic/acestep-v15-turbo',
+  messages: [{ role: 'user', content: '<prompt>' + prompt.slice(0, 500) + '</prompt>' }],
+  task_type: 'text2music',
+  audio_config: {
+    duration: duration, // 35
+    instrumental: true,
+    format: 'mp3',
+  },
+};
 
   const res = await fetch('https://api.acemusic.ai/v1/chat/completions', {
     method: 'POST',

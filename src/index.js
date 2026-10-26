@@ -1,8 +1,8 @@
 /**
  * ElionAI Relay — Cloudflare Worker
  * Variables :
- *   INFERENCEPORT_API_KEY  (Fluxion principal)
- *   PIXAZO_API_KEY         (Fluxion fallback LTX + Sonaria)
+ *   INFERENCEPORT_API_KEY  (Fluxion — Vidu Q3)
+ *   PIXAZO_API_KEY         (Sonaria + fallback LTX)
  *   GROQ_API_KEY
  *   GEMINI_API_KEY
  *   TAVILY_API_KEY, PEXELS_API_KEY (optionnel)
@@ -16,7 +16,8 @@ const CORS = {
 };
 
 const IP_BASE = 'https://sharktide-lightning.hf.space';
-const FLUXION_MODELS = new Set(['wan-fast', 'pixverse-v5']);
+/** Modèle Fluxion principal + secours si "not available" */
+const FLUXION_TRY = ['vidu-q3', 'vidu-q3-turbo', 'pixverse-v5', 'wan2.7-t2v', 'seedance-2.5-720p'];
 
 const LTX_SUBMIT = [
   'https://gateway.pixazo.ai/ltx-2-5-pro/v1/text-to-video',
@@ -62,41 +63,63 @@ function ipHeaders(env) {
   };
 }
 
-/* ---------- Fluxion InferencePort ---------- */
+/* ---------- Fluxion InferencePort (Vidu Q3) ---------- */
 async function submitInferencePort(body, env) {
   if (!env.INFERENCEPORT_API_KEY) return null;
   const prompt = String(body.ltx_prompt || body.prompt || '').trim();
   if (!prompt) return null;
 
-  let model = String(body.ltx_model || body.model || 'wan-fast').toLowerCase();
-  if (!FLUXION_MODELS.has(model)) model = 'wan-fast';
+  const preferred = String(body.ltx_model || body.model || 'vidu-q3').toLowerCase();
+  const models = [preferred, ...FLUXION_TRY.filter((m) => m !== preferred)];
   const duration = mapDuration(body.ltx_duration || body.duration);
+  const errors = [];
 
-  try {
-    const res = await fetch(IP_BASE + '/gen/videos', {
-      method: 'POST',
-      headers: ipHeaders(env),
-      body: JSON.stringify({
-        model,
-        prompt: prompt.slice(0, 800),
-        duration,
-      }),
-    });
-    const data = await res.json().catch(() => ({}));
-    const id = data.id || data.job_id || data.task_id;
-    if ((res.ok || res.status === 202) && id) {
-      return json({
-        request_id: id,
-        status: data.status || 'QUEUED',
-        provider: 'inferenceport',
-        model,
-        polling_url: IP_BASE + '/gen/videos/' + id,
+  for (const model of models) {
+    try {
+      const res = await fetch(IP_BASE + '/gen/videos', {
+        method: 'POST',
+        headers: ipHeaders(env),
+        body: JSON.stringify({
+          model,
+          prompt: prompt.slice(0, 800),
+          duration,
+        }),
       });
+      const data = await res.json().catch(() => ({}));
+      const id = data.id || data.job_id || data.task_id;
+      if ((res.ok || res.status === 202) && id) {
+        return json({
+          request_id: id,
+          status: data.status || 'QUEUED',
+          provider: 'inferenceport',
+          model,
+          polling_url: IP_BASE + '/gen/videos/' + id,
+        });
+      }
+      const msg =
+        data.detail ||
+        data.error?.message ||
+        data.error ||
+        data.message ||
+        ('HTTP ' + res.status);
+      errors.push({ model, status: res.status, error: msg });
+      // modèle indisponible → essayer le suivant
+      const s = String(msg).toLowerCase();
+      if (s.includes('not available') || s.includes('unknown model') || res.status === 400) {
+        continue;
+      }
+      // autre erreur (401, 429…) → stop
+      return { _fail: true, status: res.status, data, error: msg };
+    } catch (e) {
+      errors.push({ model, error: String(e.message || e) });
     }
-    return { _fail: true, status: res.status, data };
-  } catch (e) {
-    return { _fail: true, error: String(e.message || e) };
   }
+  return {
+    _fail: true,
+    status: 502,
+    error: 'Aucun modèle vidéo accepté',
+    data: { details: errors },
+  };
 }
 
 async function statusInferencePort(id, env) {
@@ -131,7 +154,9 @@ async function statusInferencePort(id, env) {
   let status = data.status || 'UNKNOWN';
   if (st === 'completed' || st === 'succeeded' || st === 'success') status = 'COMPLETED';
   else if (st === 'failed' || st === 'error') status = 'FAILED';
-  else if (st === 'pending' || st === 'queued' || st === 'processing' || st === 'running') status = 'PROCESSING';
+  else if (st === 'pending' || st === 'queued' || st === 'processing' || st === 'running') {
+    status = 'PROCESSING';
+  }
 
   return json({
     request_id: id,
@@ -143,7 +168,7 @@ async function statusInferencePort(id, env) {
   });
 }
 
-/* ---------- Fluxion LTX Pixazo (fallback) ---------- */
+/* ---------- LTX Pixazo (fallback uniquement si pas de clé IP) ---------- */
 async function submitLtx(body, env) {
   const key = env.PIXAZO_API_KEY;
   if (!key) return json({ error: 'PIXAZO_API_KEY manquante' }, 500);
@@ -234,7 +259,6 @@ async function statusLtx(body, env) {
   });
 }
 
-/* ---------- Submit / status unifiés ---------- */
 async function submitFluxion(body, env) {
   if (env.INFERENCEPORT_API_KEY) {
     const ip = await submitInferencePort(body, env);
@@ -249,7 +273,8 @@ async function submitFluxion(body, env) {
             : detail.detail || detail.error || JSON.stringify(detail).slice(0, 300),
         provider: 'inferenceport',
         status: st,
-        hint: st === 401 ? 'Vérifie INFERENCEPORT_API_KEY' : 'Upstream Fluxion indisponible',
+        details: ip && ip.data && ip.data.details,
+        hint: st === 401 ? 'Vérifie INFERENCEPORT_API_KEY' : 'Aucun modèle vidéo disponible pour ce compte',
       },
       st >= 400 ? st : 502
     );
@@ -541,7 +566,7 @@ async function authLinear(body, env) {
       redirect_uri: body.redirect_uri || '',
       client_id: clientId,
       client_secret: clientSecret,
-      grant_type: 'authorization_code',
+  grant_type: 'authorization_code',
     }),
   });
   const data = await res.json().catch(() => ({}));
@@ -562,10 +587,11 @@ export default {
       return json({
         ok: true,
         service: 'Elion relay',
-        fluxion: env.INFERENCEPORT_API_KEY ? 'inferenceport+pixazo-fallback' : 'pixazo-ltx',
+        fluxion: env.INFERENCEPORT_API_KEY ? 'vidu-q3+fallback' : 'pixazo-ltx',
         has_ip_key: !!env.INFERENCEPORT_API_KEY,
         key_len: env.INFERENCEPORT_API_KEY ? String(env.INFERENCEPORT_API_KEY).length : 0,
-        routes: ['ltx_prompt', 'ltx_status', 'pixazo_prompt', 'pixazo_poll_id', 'groq', 'gemini','tts', 'auth/*'],
+        models: FLUXION_TRY,
+        routes: ['ltx_prompt', 'ltx_status', 'pixazo_prompt', 'pixazo_poll_id', 'groq', 'gemini', 'tts', 'auth/*'],
       });
     }
 

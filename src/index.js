@@ -2,7 +2,8 @@
  * ElionAI Relay — Cloudflare Worker
  * Variables :
  *   INFERENCEPORT_API_KEY  (Fluxion — Vidu Q3)
- *   PIXAZO_API_KEY         (Sonaria + fallback LTX)
+ *   ACE_MUSIC_API_KEY      (Sonaria — Ace Music)
+ *   PIXAZO_API_KEY         (optionnel, fallback)
  *   GROQ_API_KEY
  *   GEMINI_API_KEY
  *   TAVILY_API_KEY, PEXELS_API_KEY (optionnel)
@@ -16,7 +17,6 @@ const CORS = {
 };
 
 const IP_BASE = 'https://sharktide-lightning.hf.space';
-/** Modèle Fluxion principal + secours si "not available" */
 const FLUXION_TRY = ['vidu-q3', 'vidu-q3-turbo', 'pixverse-v5', 'wan2.7-t2v', 'seedance-2.5-720p'];
 
 const LTX_SUBMIT = [
@@ -26,11 +26,6 @@ const LTX_SUBMIT = [
   'https://gateway.pixazo.ai/ltx-2-3-text-to-video/v1/ltx-2-3-text-to-video-request',
 ];
 const LTX_STATUS = 'https://gateway.pixazo.ai/v2/requests/status/';
-
-const SONARIA_SUBMIT = [
-  'https://gateway.pixazo.ai/stable-audio/v1/text-to-audio',
-  'https://gateway.pixazo.ai/stable-audio-open/v1/text-to-audio',
-];
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -98,17 +93,15 @@ async function submitInferencePort(body, env) {
       }
       const msg =
         data.detail ||
-        data.error?.message ||
+        (data.error && data.error.message) ||
         data.error ||
         data.message ||
         ('HTTP ' + res.status);
       errors.push({ model, status: res.status, error: msg });
-      // modèle indisponible → essayer le suivant
       const s = String(msg).toLowerCase();
       if (s.includes('not available') || s.includes('unknown model') || res.status === 400) {
         continue;
       }
-      // autre erreur (401, 429…) → stop
       return { _fail: true, status: res.status, data, error: msg };
     } catch (e) {
       errors.push({ model, error: String(e.message || e) });
@@ -168,7 +161,7 @@ async function statusInferencePort(id, env) {
   });
 }
 
-/* ---------- LTX Pixazo (fallback uniquement si pas de clé IP) ---------- */
+/* ---------- LTX Pixazo (fallback si pas de clé IP) ---------- */
 async function submitLtx(body, env) {
   const key = env.PIXAZO_API_KEY;
   if (!key) return json({ error: 'PIXAZO_API_KEY manquante' }, 500);
@@ -297,60 +290,86 @@ async function statusFluxion(body, env) {
   return json({ error: 'Aucune clé pour poll Fluxion' }, 500);
 }
 
-/* ---------- Sonaria ---------- */
-async function submitSonaria(body, env) {
-  const key = env.PIXAZO_API_KEY;
-  if (!key) return json({ error: 'PIXAZO_API_KEY manquante' }, 500);
-  const prompt = String(body.pixazo_prompt || '').trim();
-  if (!prompt) return json({ error: 'pixazo_prompt manquant' }, 400);
+/* ---------- Sonaria (Ace Music) ---------- */
+async function submitSonariaAce(body, env) {
+  const key = env.ACE_MUSIC_API_KEY;
+  if (!key) return json({ error: 'ACE_MUSIC_API_KEY manquante sur le Worker' }, 500);
 
-  const payload = { prompt, duration: Number(body.pixazo_duration) || 35 };
-  const errors = [];
-  for (const url of SONARIA_SUBMIT) {
-    try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Ocp-Apim-Subscription-Key': key },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json().catch(() => ({}));
-      const requestId = data.request_id || data.requestId || data.id;
-      if ((res.ok || res.status === 202) && requestId) {
-        return json({ request_id: requestId, status: data.status || 'QUEUED', ...data });
-      }
-      errors.push({ url, status: res.status, body: data });
-    } catch (e) {
-      errors.push({ url, error: String(e.message || e) });
-    }
-  }
-  return json({ error: 'Sonaria: aucun endpoint audio accepté', details: errors }, 502);
-}
+  const prompt = String(body.ace_prompt || body.pixazo_prompt || body.prompt || '').trim();
+  if (!prompt) return json({ error: 'ace_prompt manquant' }, 400);
 
-async function pollSonaria(body, env) {
-  const key = env.PIXAZO_API_KEY;
-  if (!key) return json({ error: 'PIXAZO_API_KEY manquante' }, 500);
-  const id = String(body.pixazo_poll_id || '').trim();
-  if (!id) return json({ error: 'pixazo_poll_id manquant' }, 400);
+  const duration = Math.max(10, Math.min(60, Number(body.ace_duration || body.pixazo_duration) || 30));
 
-  const res = await fetch(LTX_STATUS + encodeURIComponent(id), {
-    headers: { 'Ocp-Apim-Subscription-Key': key },
+  const payload = {
+    model: 'acemusic/acestep-v15-turbo',
+    messages: [{ role: 'user', content: prompt.slice(0, 500) }],
+    modalities: ['audio', 'text'],
+    task_type: 'text2music',
+    audio_duration: duration,
+  };
+
+  const res = await fetch('https://api.acemusic.ai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + key,
+    },
+    body: JSON.stringify(payload),
   });
+
   const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    return json(
+      {
+        error:
+          data.detail ||
+          (data.error && data.error.message) ||
+          data.error ||
+          data.message ||
+          ('HTTP ' + res.status),
+        raw: data,
+      },
+      res.status >= 400 ? res.status : 502
+    );
+  }
+
+  let b64 = null;
   let audioUrl = null;
-  const out = data.output || {};
-  if (Array.isArray(out.media_url) && out.media_url[0]) audioUrl = out.media_url[0];
-  else if (typeof out.media_url === 'string') audioUrl = out.media_url;
-  else if (out.audio_url) audioUrl = out.audio_url;
-  audioUrl = audioUrl || data.audio_url || data.url || null;
+  try {
+    const choice = data.choices && data.choices[0];
+    const msg = choice && choice.message;
+    if (msg) {
+      if (typeof msg.audio === 'string') b64 = msg.audio;
+      else if (msg.audio && msg.audio.data) b64 = msg.audio.data;
+      else if (Array.isArray(msg.content)) {
+        for (const p of msg.content) {
+          if (p.type === 'output_audio' && p.audio && p.audio.data) b64 = p.audio.data;
+          if (p.type === 'audio' && p.data) b64 = p.data;
+        }
+      }
+    }
+    if (!b64 && data.audio_base64) b64 = data.audio_base64;
+    if (!b64 && data.audio) b64 = typeof data.audio === 'string' ? data.audio : data.audio.data;
+    if (data.audio_url) audioUrl = data.audio_url;
+    if (data.url && /\.(mp3|wav|ogg)/i.test(String(data.url))) audioUrl = data.url;
+  } catch (_) {}
+
+  if (!audioUrl && b64) {
+    b64 = String(b64).replace(/^data:audio\/[^;]+;base64,/, '');
+    audioUrl = 'data:audio/mpeg;base64,' + b64;
+  }
+
+  if (!audioUrl) {
+    return json({ error: 'Ace Music a répondu sans audio', raw: data }, 502);
+  }
 
   return json({
-    request_id: id,
-    status: data.status || 'UNKNOWN',
+    ok: true,
+    provider: 'ace-music',
+    status: 'COMPLETED',
     audio_url: audioUrl,
     url: audioUrl,
-    output: data.output,
-    error: data.error || null,
-    ...data,
+    audio_base64: b64 || undefined,
   });
 }
 
@@ -566,7 +585,7 @@ async function authLinear(body, env) {
       redirect_uri: body.redirect_uri || '',
       client_id: clientId,
       client_secret: clientSecret,
-  grant_type: 'authorization_code',
+      grant_type: 'authorization_code',
     }),
   });
   const data = await res.json().catch(() => ({}));
@@ -588,10 +607,12 @@ export default {
         ok: true,
         service: 'Elion relay',
         fluxion: env.INFERENCEPORT_API_KEY ? 'vidu-q3+fallback' : 'pixazo-ltx',
+        sonaria: env.ACE_MUSIC_API_KEY ? 'ace-music' : 'off',
         has_ip_key: !!env.INFERENCEPORT_API_KEY,
+        has_ace_key: !!env.ACE_MUSIC_API_KEY,
         key_len: env.INFERENCEPORT_API_KEY ? String(env.INFERENCEPORT_API_KEY).length : 0,
         models: FLUXION_TRY,
-        routes: ['ltx_prompt', 'ltx_status', 'pixazo_prompt', 'pixazo_poll_id', 'groq', 'gemini', 'tts', 'auth/*'],
+        routes: ['ltx_prompt', 'ltx_status', 'ace_prompt', 'pixazo_prompt', 'groq', 'gemini', 'tts', 'auth/*'],
       });
     }
 
@@ -628,8 +649,7 @@ export default {
 
     if (body.ltx_prompt != null) return submitFluxion(body, env);
     if (body.ltx_status) return statusFluxion(body, env);
-    if (body.pixazo_prompt != null) return submitSonaria(body, env);
-    if (body.pixazo_poll_id) return pollSonaria(body, env);
+    if (body.ace_prompt != null || body.pixazo_prompt != null) return submitSonariaAce(body, env);
     if (body.pexels_query != null) return pexels(body, env);
     if (body.tavily_query != null) return tavily(body, env);
     if (body.github_oauth) return authGithub(body, env);

@@ -1,13 +1,14 @@
 /**
  * ElionAI Relay — Cloudflare Worker
- * Variables :
- *   INFERENCEPORT_API_KEY  (Fluxion — Vidu Q3)
- *   ACE_MUSIC_API_KEY      (Sonaria — Ace Music)
- *   PIXAZO_API_KEY         (optionnel, fallback)
+ * Bindings :
+ *   AI                     (Workers AI — Illustro Engine Flux 2)
+ * Variables / Secrets :
+ *   INFERENCEPORT_API_KEY  (Fluxion)
+ *   ACE_MUSIC_API_KEY      (Sonaria)
+ *   PIXAZO_API_KEY         (optionnel)
  *   GROQ_API_KEY
  *   GEMINI_API_KEY
  *   TAVILY_API_KEY, PEXELS_API_KEY (optionnel)
- *   DISCORD_ / GITHUB_ / LINEAR_ / TURNSTILE_ (optionnel)
  */
 
 const CORS = {
@@ -18,6 +19,14 @@ const CORS = {
 
 const IP_BASE = 'https://sharktide-lightning.hf.space';
 const FLUXION_TRY = ['vidu-q3', 'vidu-q3-turbo', 'pixverse-v5', 'wan2.7-t2v', 'seedance-2.5-720p'];
+
+/** Illustro Engine — famille Flux (ordre de tentative) */
+const ILLUSTRO_FLUX2_MODELS = [
+  '@cf/black-forest-labs/flux-2-klein-4b',
+  'black-forest-labs/flux-2-max',
+  '@cf/black-forest-labs/flux-2-dev',
+  '@cf/black-forest-labs/flux-1-schnell',
+];
 
 const LTX_SUBMIT = [
   'https://gateway.pixazo.ai/ltx-2-5-pro/v1/text-to-video',
@@ -58,7 +67,94 @@ function ipHeaders(env) {
   };
 }
 
-/* ---------- Fluxion InferencePort (Vidu Q3) ---------- */
+/* ---------- Illustro Engine (Flux 2 Workers AI) ---------- */
+async function submitIllustroFlux2(body, env) {
+  if (!env.AI) {
+    return json({
+      error: 'Workers AI non lié — ajoute le binding AI (Settings → Bindings → Workers AI, nom: AI)',
+    }, 500);
+  }
+
+  const prompt = String(body.illustro_prompt || body.prompt || '').trim();
+  if (!prompt) return json({ error: 'illustro_prompt manquant' }, 400);
+
+  const width = Math.min(1024, Math.max(256, Number(body.width) || 1024));
+  const height = Math.min(1024, Math.max(256, Number(body.height) || 1024));
+  const fullPrompt =
+    prompt.slice(0, 900) + ', highly detailed, cinematic lighting, no text, no watermark';
+
+  const preferred = body.illustro_model_id ? [String(body.illustro_model_id)] : [];
+  const models = preferred.concat(ILLUSTRO_FLUX2_MODELS.filter((m) => m !== preferred[0]));
+  const errors = [];
+
+  for (const model of models) {
+    try {
+      const result = await env.AI.run(model, {
+        prompt: fullPrompt,
+        width,
+        height,
+      });
+
+      let imageUrl = null;
+      let b64 = null;
+
+      if (result && typeof result === 'object') {
+        if (typeof result.image === 'string') {
+          if (result.image.startsWith('http') || result.image.startsWith('data:')) {
+            imageUrl = result.image;
+          } else {
+            b64 = result.image;
+          }
+        } else if (result.result && result.result.image) {
+          const im = result.result.image;
+          if (typeof im === 'string' && (im.startsWith('http') || im.startsWith('data:'))) imageUrl = im;
+          else b64 = im;
+        } else if (result.image && result.image.data) {
+          b64 = result.image.data;
+        }
+      } else if (typeof result === 'string') {
+        if (result.startsWith('http') || result.startsWith('data:')) imageUrl = result;
+        else b64 = result;
+      }
+
+      if (!imageUrl && !b64 && (result instanceof ArrayBuffer || ArrayBuffer.isView(result))) {
+        const bytes = result instanceof ArrayBuffer ? new Uint8Array(result) : new Uint8Array(result.buffer);
+        let s = '';
+        for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+        b64 = btoa(s);
+      }
+
+      if (!imageUrl && b64) {
+        b64 = String(b64).replace(/^data:image\/[^;]+;base64,/, '');
+        imageUrl = 'data:image/jpeg;base64,' + b64;
+      }
+
+      if (imageUrl) {
+        return json({
+          ok: true,
+          provider: 'workers-ai-flux2',
+          model,
+          image_url: imageUrl,
+          url: imageUrl,
+        });
+      }
+      errors.push({ model, error: 'réponse sans image' });
+    } catch (e) {
+      errors.push({ model, error: String(e.message || e) });
+    }
+  }
+
+  return json(
+    {
+      error: 'Aucun modèle Flux n\'a généré d\'image',
+      details: errors,
+      hint: 'Vérifie le binding AI + neurons Workers AI',
+    },
+    502
+  );
+}
+
+/* ---------- Fluxion InferencePort ---------- */
 async function submitInferencePort(body, env) {
   if (!env.INFERENCEPORT_API_KEY) return null;
   const prompt = String(body.ltx_prompt || body.prompt || '').trim();
@@ -74,11 +170,7 @@ async function submitInferencePort(body, env) {
       const res = await fetch(IP_BASE + '/gen/videos', {
         method: 'POST',
         headers: ipHeaders(env),
-        body: JSON.stringify({
-          model,
-          prompt: prompt.slice(0, 800),
-          duration,
-        }),
+        body: JSON.stringify({ model, prompt: prompt.slice(0, 800), duration }),
       });
       const data = await res.json().catch(() => ({}));
       const id = data.id || data.job_id || data.task_id;
@@ -99,20 +191,13 @@ async function submitInferencePort(body, env) {
         ('HTTP ' + res.status);
       errors.push({ model, status: res.status, error: msg });
       const s = String(msg).toLowerCase();
-      if (s.includes('not available') || s.includes('unknown model') || res.status === 400) {
-        continue;
-      }
+      if (s.includes('not available') || s.includes('unknown model') || res.status === 400) continue;
       return { _fail: true, status: res.status, data, error: msg };
     } catch (e) {
       errors.push({ model, error: String(e.message || e) });
     }
   }
-  return {
-    _fail: true,
-    status: 502,
-    error: 'Aucun modèle vidéo accepté',
-    data: { details: errors },
-  };
+  return { _fail: true, status: 502, error: 'Aucun modèle vidéo accepté', data: { details: errors } };
 }
 
 async function statusInferencePort(id, env) {
@@ -122,52 +207,32 @@ async function statusInferencePort(id, env) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     return json(
-      {
-        error: data.detail || data.error || data.message || 'Status InferencePort échoué',
-        status: 'ERROR',
-        raw: data,
-      },
+      { error: data.detail || data.error || data.message || 'Status échoué', status: 'ERROR', raw: data },
       res.status >= 400 ? res.status : 502
     );
   }
-
   const st = String(data.status || data.state || '').toLowerCase();
   let videoUrl =
     data.url ||
     data.video_url ||
     data.content_url ||
     (data.output && (data.output.url || data.output.video_url)) ||
-    (Array.isArray(data.output && data.output.urls) && data.output.urls[0]) ||
     null;
-
   if ((st === 'completed' || st === 'succeeded' || st === 'success') && !videoUrl) {
     videoUrl = IP_BASE + '/gen/videos/' + encodeURIComponent(id) + '/content';
   }
-
   let status = data.status || 'UNKNOWN';
   if (st === 'completed' || st === 'succeeded' || st === 'success') status = 'COMPLETED';
   else if (st === 'failed' || st === 'error') status = 'FAILED';
-  else if (st === 'pending' || st === 'queued' || st === 'processing' || st === 'running') {
-    status = 'PROCESSING';
-  }
-
-  return json({
-    request_id: id,
-    status,
-    video_url: videoUrl,
-    url: videoUrl,
-    provider: 'inferenceport',
-    data,
-  });
+  else if (['pending', 'queued', 'processing', 'running'].includes(st)) status = 'PROCESSING';
+  return json({ request_id: id, status, video_url: videoUrl, url: videoUrl, provider: 'inferenceport', data });
 }
 
-/* ---------- LTX Pixazo (fallback si pas de clé IP) ---------- */
 async function submitLtx(body, env) {
   const key = env.PIXAZO_API_KEY;
   if (!key) return json({ error: 'PIXAZO_API_KEY manquante' }, 500);
   const prompt = String(body.ltx_prompt || '').trim();
   if (!prompt) return json({ error: 'ltx_prompt manquant' }, 400);
-
   const payload = {
     prompt,
     duration: mapDuration(body.ltx_duration),
@@ -176,11 +241,7 @@ async function submitLtx(body, env) {
     fps: 24,
     generate_audio: body.ltx_sound !== false,
   };
-
-  const endpoints = body.ltx_pro
-    ? LTX_SUBMIT
-    : [LTX_SUBMIT[1], LTX_SUBMIT[0], LTX_SUBMIT[2], LTX_SUBMIT[3]];
-
+  const endpoints = body.ltx_pro ? LTX_SUBMIT : [LTX_SUBMIT[1], LTX_SUBMIT[0], LTX_SUBMIT[2], LTX_SUBMIT[3]];
   const errors = [];
   for (const url of endpoints) {
     try {
@@ -195,17 +256,13 @@ async function submitLtx(body, env) {
       });
       const data = await res.json().catch(() => ({}));
       const requestId =
-        data.request_id ||
-        data.requestId ||
-        data.id ||
-        (data.data && (data.data.request_id || data.data.id));
+        data.request_id || data.requestId || data.id || (data.data && (data.data.request_id || data.data.id));
       if ((res.ok || res.status === 202) && requestId) {
         return json({
           request_id: requestId,
           status: data.status || 'QUEUED',
           provider: 'pixazo-ltx',
           polling_url: data.polling_url || LTX_STATUS + requestId,
-          endpoint: url,
         });
       }
       errors.push({ url, status: res.status, body: data });
@@ -213,7 +270,7 @@ async function submitLtx(body, env) {
       errors.push({ url, error: String(e.message || e) });
     }
   }
-  return json({ error: "Fluxion: aucun endpoint LTX n'a accepté la requête", details: errors }, 502);
+  return json({ error: 'Aucun endpoint LTX accepté', details: errors }, 502);
 }
 
 async function statusLtx(body, env) {
@@ -221,116 +278,80 @@ async function statusLtx(body, env) {
   if (!key) return json({ error: 'PIXAZO_API_KEY manquante' }, 500);
   const id = String(body.ltx_status || body.request_id || '').trim();
   if (!id) return json({ error: 'ltx_status manquant' }, 400);
-
   const res = await fetch(LTX_STATUS + encodeURIComponent(id), {
     headers: { 'Ocp-Apim-Subscription-Key': key },
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    return json(
-      { error: data.error || data.message || 'Status LTX échoué', status: data.status || 'ERROR', raw: data },
-      res.status >= 400 ? res.status : 502
-    );
+    return json({ error: data.error || data.message || 'Status LTX échoué', raw: data }, res.status >= 400 ? res.status : 502);
   }
-
   let videoUrl = null;
   const out = data.output || {};
   if (Array.isArray(out.media_url) && out.media_url[0]) videoUrl = out.media_url[0];
   else if (typeof out.media_url === 'string') videoUrl = out.media_url;
-  else if (out.preview_video && out.preview_video.url) videoUrl = out.preview_video.url;
   else if (out.video_url) videoUrl = out.video_url;
   else if (out.url) videoUrl = out.url;
-  videoUrl = videoUrl || data.video_url || data.url || (data.result && data.result.video_url) || null;
-
-  return json({
-    request_id: id,
-    status: data.status || 'UNKNOWN',
-    video_url: videoUrl,
-    url: videoUrl,
-    provider: 'pixazo-ltx',
-    data,
-  });
+  videoUrl = videoUrl || data.video_url || data.url || null;
+  return json({ request_id: id, status: data.status || 'UNKNOWN', video_url: videoUrl, url: videoUrl, provider: 'pixazo-ltx', data });
 }
 
 async function submitFluxion(body, env) {
   if (env.INFERENCEPORT_API_KEY) {
     const ip = await submitInferencePort(body, env);
     if (ip && !ip._fail) return ip;
-    const detail = (ip && (ip.data || ip.error)) || 'InferencePort a refusé la requête';
+    const detail = (ip && (ip.data || ip.error)) || 'InferencePort refusé';
     const st = (ip && ip.status) || 502;
     return json(
       {
-        error:
-          typeof detail === 'string'
-            ? detail
-            : detail.detail || detail.error || JSON.stringify(detail).slice(0, 300),
+        error: typeof detail === 'string' ? detail : detail.detail || detail.error || JSON.stringify(detail).slice(0, 300),
         provider: 'inferenceport',
         status: st,
         details: ip && ip.data && ip.data.details,
-        hint: st === 401 ? 'Vérifie INFERENCEPORT_API_KEY' : 'Aucun modèle vidéo disponible pour ce compte',
       },
       st >= 400 ? st : 502
     );
   }
   if (env.PIXAZO_API_KEY) return submitLtx(body, env);
-  return json({ error: 'INFERENCEPORT_API_KEY manquante sur le Worker' }, 500);
+  return json({ error: 'INFERENCEPORT_API_KEY manquante' }, 500);
 }
 
 async function statusFluxion(body, env) {
   const id = String(body.ltx_status || body.request_id || '').trim();
   if (!id) return json({ error: 'ltx_status manquant' }, 400);
-
-  if (env.INFERENCEPORT_API_KEY && (body.provider === 'inferenceport' || id.includes('-') || body.force_ip)) {
+  if (env.INFERENCEPORT_API_KEY) {
     try {
       return await statusInferencePort(id, env);
     } catch (_) {}
   }
   if (env.PIXAZO_API_KEY) return statusLtx(body, env);
-  if (env.INFERENCEPORT_API_KEY) return statusInferencePort(id, env);
   return json({ error: 'Aucune clé pour poll Fluxion' }, 500);
 }
 
 /* ---------- Sonaria (Ace Music) ---------- */
 async function submitSonariaAce(body, env) {
   const key = env.ACE_MUSIC_API_KEY;
-  if (!key) return json({ error: 'ACE_MUSIC_API_KEY manquante sur le Worker' }, 500);
-
+  if (!key) return json({ error: 'ACE_MUSIC_API_KEY manquante' }, 500);
   const prompt = String(body.ace_prompt || body.pixazo_prompt || body.prompt || '').trim();
   if (!prompt) return json({ error: 'ace_prompt manquant' }, 400);
-
   const duration = Math.max(10, Math.min(60, Number(body.ace_duration || body.pixazo_duration) || 30));
 
   const payload = {
-  model: 'acemusic/acestep-v15-turbo',
-  messages: [{ role: 'user', content: '<prompt>' + prompt.slice(0, 500) + '</prompt>' }],
-  task_type: 'text2music',
-  audio_config: {
-    duration: duration, // 35
-    instrumental: true,
-    format: 'mp3',
-  },
-};
+    model: 'acemusic/acestep-v15-turbo',
+    messages: [{ role: 'user', content: '<prompt>' + prompt.slice(0, 500) + '</prompt>' }],
+    task_type: 'text2music',
+    audio_config: { duration, instrumental: true, format: 'mp3' },
+  };
 
   const res = await fetch('https://api.acemusic.ai/v1/chat/completions', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: 'Bearer ' + key,
-    },
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
     body: JSON.stringify(payload),
   });
-
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     return json(
       {
-        error:
-          data.detail ||
-          (data.error && data.error.message) ||
-          data.error ||
-          data.message ||
-          ('HTTP ' + res.status),
-        raw: data,
+        error: data.detail || (data.error && data.error.message) || data.error || data.message || ('HTTP ' + res.status),
       },
       res.status >= 400 ? res.status : 502
     );
@@ -339,55 +360,35 @@ async function submitSonariaAce(body, env) {
   let audioUrl = null;
   try {
     const msg = data.choices && data.choices[0] && data.choices[0].message;
-    if (msg) {
-      // Format officiel Ace : message.audio[0].audio_url.url
-      if (Array.isArray(msg.audio) && msg.audio.length) {
-        const a0 = msg.audio[0];
-        if (a0 && a0.audio_url && a0.audio_url.url) audioUrl = a0.audio_url.url;
-        else if (a0 && a0.url) audioUrl = a0.url;
-        else if (typeof a0 === 'string') audioUrl = a0;
-      } else if (msg.audio && msg.audio.data) {
-        audioUrl = 'data:audio/mpeg;base64,' + msg.audio.data;
-      } else if (typeof msg.audio === 'string') {
-        audioUrl = msg.audio.startsWith('data:') ? msg.audio : 'data:audio/mpeg;base64,' + msg.audio;
-      }
+    if (msg && Array.isArray(msg.audio) && msg.audio[0]) {
+      const a0 = msg.audio[0];
+      if (a0.audio_url && a0.audio_url.url) audioUrl = a0.audio_url.url;
+      else if (a0.url) audioUrl = a0.url;
+    } else if (msg && msg.audio && msg.audio.data) {
+      audioUrl = 'data:audio/mpeg;base64,' + msg.audio.data;
     }
     if (!audioUrl && data.audio_url) audioUrl = data.audio_url;
-    if (!audioUrl && data.audio_base64) audioUrl = 'data:audio/mpeg;base64,' + data.audio_base64;
   } catch (_) {}
 
-  if (!audioUrl) {
-    return json({ error: 'Ace Music a répondu sans audio', raw: data }, 502);
-  }
-
-  return json({
-    ok: true,
-    provider: 'ace-music',
-    status: 'COMPLETED',
-    audio_url: audioUrl,
-    url: audioUrl,
-  });
+  if (!audioUrl) return json({ error: 'Ace Music a répondu sans audio', raw: data }, 502);
+  return json({ ok: true, provider: 'ace-music', status: 'COMPLETED', audio_url: audioUrl, url: audioUrl });
 }
 
-/* ---------- Gemini ---------- */
+/* ---------- Gemini / Groq ---------- */
 async function relayGemini(body, env) {
   const key = env.GEMINI_API_KEY;
-  if (!key) return json({ error: 'GEMINI_API_KEY manquante sur le Worker' }, 500);
-
+  if (!key) return json({ error: 'GEMINI_API_KEY manquante' }, 500);
   const model = body.gemini_model || body.model || 'gemini-2.5-flash';
   const url =
     'https://generativelanguage.googleapis.com/v1beta/models/' +
     encodeURIComponent(model) +
     ':generateContent?key=' +
     encodeURIComponent(key);
-
   const payload = { contents: body.contents || body.messages || [] };
   if (body.systemInstruction) payload.systemInstruction = body.systemInstruction;
   if (body.system_instruction) payload.systemInstruction = body.system_instruction;
   if (body.generationConfig) payload.generationConfig = body.generationConfig;
   if (body.tools) payload.tools = body.tools;
-  if (body.safetySettings) payload.safetySettings = body.safetySettings;
-
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -398,7 +399,6 @@ async function relayGemini(body, env) {
   return json(data);
 }
 
-/* ---------- Groq ---------- */
 function geminiContentsToOpenAIMessages(body) {
   const messages = [];
   const sysParts =
@@ -407,32 +407,24 @@ function geminiContentsToOpenAIMessages(body) {
     [];
   const sys = sysParts.map((p) => p.text || '').filter(Boolean).join('\n') || body.system || '';
   if (sys) messages.push({ role: 'system', content: sys });
-
   for (const c of body.contents || []) {
     const role = c.role === 'model' ? 'assistant' : 'user';
     let text = '';
-    for (const p of c.parts || []) {
-      if (typeof p.text === 'string') text += p.text;
-    }
+    for (const p of c.parts || []) if (typeof p.text === 'string') text += p.text;
     if (text.trim()) messages.push({ role, content: text });
   }
-
   if (Array.isArray(body.messages) && body.messages.length) {
-    if (!messages.length || (messages.length === 1 && messages[0].role === 'system')) {
-      return body.messages;
-    }
+    if (!messages.length || (messages.length === 1 && messages[0].role === 'system')) return body.messages;
   }
   return messages;
 }
 
 async function relayGroq(body, env) {
   const key = env.GROQ_API_KEY;
-  if (!key) return json({ error: 'GROQ_API_KEY manquante sur le Worker' }, 500);
-
+  if (!key) return json({ error: 'GROQ_API_KEY manquante' }, 500);
   const model = body.groq_model || body.model || 'openai/gpt-oss-120b';
   const messages = geminiContentsToOpenAIMessages(body);
-  if (!messages.length) return json({ error: 'Aucun message à envoyer à Groq' }, 400);
-
+  if (!messages.length) return json({ error: 'Aucun message' }, 400);
   const payload = {
     model,
     messages,
@@ -443,31 +435,18 @@ async function relayGroq(body, env) {
     max_tokens: (body.generationConfig && body.generationConfig.maxOutputTokens) || 8192,
   };
   if (body.reasoning_format) payload.reasoning_format = body.reasoning_format;
-
   const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
-    headers: {
-      Authorization: 'Bearer ' + key,
-      'Content-Type': 'application/json',
-    },
+    headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    return json({ error: data.error || data, status: res.status }, res.status >= 400 ? res.status : 502);
-  }
-
+  if (!res.ok) return json({ error: data.error || data, status: res.status }, res.status >= 400 ? res.status : 502);
   const text =
     (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
-
-  return json({
-    candidates: [{ content: { role: 'model', parts: [{ text }] } }],
-    groq: data,
-  });
+  return json({ candidates: [{ content: { role: 'model', parts: [{ text }] } }], groq: data });
 }
 
-/* ---------- Pexels / Tavily / TTS / Auth ---------- */
 async function pexels(body, env) {
   const key = env.PEXELS_API_KEY;
   if (!key) return json({ photos: [], error: 'PEXELS_API_KEY manquante' }, 200);
@@ -513,82 +492,11 @@ async function handleTts(body) {
     },
   });
   if (!r.ok) return new Response('TTS upstream error', { status: 502, headers: CORS });
-  const audio = await r.arrayBuffer();
-  return new Response(audio, {
+  return new Response(await r.arrayBuffer(), {
     headers: { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store', ...CORS },
   });
 }
 
-async function authDiscord(body, env) {
-  const clientId = env.DISCORD_CLIENT_ID;
-  const clientSecret = env.DISCORD_CLIENT_SECRET;
-  if (!clientId || !clientSecret) return json({ error: 'Discord non configuré sur le Worker' }, 500);
-  const params = new URLSearchParams({
-    client_id: clientId,
-    client_secret: clientSecret,
-    grant_type: 'authorization_code',
-    code: body.code || '',
-    redirect_uri: body.redirect_uri || '',
-  });
-  const res = await fetch('https://discord.com/api/oauth2/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: params,
-  });
-  const data = await res.json().catch(() => ({}));
-  return json(data, res.ok ? 200 : res.status);
-}
-
-async function authTurnstile(body, env) {
-  const secret = env.TURNSTILE_SECRET_KEY;
-  if (!secret) return json({ success: true, skipped: true });
-  const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ secret, response: body.token || body.response || '' }),
-  });
-  const data = await res.json().catch(() => ({ success: false }));
-  return json(data);
-}
-
-async function authGithub(body, env) {
-  const clientId = env.GITHUB_CLIENT_ID;
-  const clientSecret = env.GITHUB_CLIENT_SECRET;
-  if (!clientId || !clientSecret) return json({ error: 'GitHub non configuré' }, 500);
-  const res = await fetch('https://github.com/login/oauth/access_token', {
-    method: 'POST',
-    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      client_id: clientId,
-      client_secret: clientSecret,
-      code: body.code,
-      redirect_uri: body.redirect_uri,
-    }),
-  });
-  const data = await res.json().catch(() => ({}));
-  return json(data, res.ok ? 200 : res.status);
-}
-
-async function authLinear(body, env) {
-  const clientId = env.LINEAR_CLIENT_ID || body.client_id;
-  const clientSecret = env.LINEAR_CLIENT_SECRET || body.client_secret;
-  if (!clientId || !clientSecret) return json({ error: 'Linear non configuré' }, 500);
-  const res = await fetch('https://api.linear.app/oauth/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      code: body.code || '',
-      redirect_uri: body.redirect_uri || '',
-      client_id: clientId,
-      client_secret: clientSecret,
-      grant_type: 'authorization_code',
-    }),
-  });
-  const data = await res.json().catch(() => ({}));
-  return json(data, res.ok ? 200 : res.status);
-}
-
-/* ---------- Router ---------- */
 export default {
   async fetch(request, env) {
     if (request.method === 'OPTIONS') {
@@ -602,13 +510,14 @@ export default {
       return json({
         ok: true,
         service: 'Elion relay',
-        fluxion: env.INFERENCEPORT_API_KEY ? 'vidu-q3+fallback' : 'pixazo-ltx',
+        fluxion: env.INFERENCEPORT_API_KEY ? 'vidu-q3+fallback' : 'off',
         sonaria: env.ACE_MUSIC_API_KEY ? 'ace-music' : 'off',
+        illustro: env.AI ? 'flux-2-family' : 'off',
         has_ip_key: !!env.INFERENCEPORT_API_KEY,
         has_ace_key: !!env.ACE_MUSIC_API_KEY,
-        key_len: env.INFERENCEPORT_API_KEY ? String(env.INFERENCEPORT_API_KEY).length : 0,
+        has_ai_binding: !!env.AI,
         models: FLUXION_TRY,
-        routes: ['ltx_prompt', 'ltx_status', 'ace_prompt', 'pixazo_prompt', 'groq', 'gemini', 'tts', 'auth/*'],
+        routes: ['illustro_prompt', 'ltx_prompt', 'ltx_status', 'ace_prompt', 'groq', 'gemini', 'tts'],
       });
     }
 
@@ -619,21 +528,7 @@ export default {
       try {
         body = await request.json();
       } catch (_) {}
-      return handleTts(body);
-    }
-    if (path.endsWith('/auth/discord')) {
-      let body = {};
-      try {
-        body = await request.json();
-      } catch (_) {}
-      return authDiscord(body, env);
-    }
-    if (path.endsWith('/auth/turnstile')) {
-      let body = {};
-      try {
-        body = await request.json();
-      } catch (_) {}
-      return authTurnstile(body, env);
+     return handleTts(body);
     }
 
     let body = {};
@@ -643,13 +538,12 @@ export default {
       return json({ error: 'JSON invalide' }, 400);
     }
 
+    if (body.illustro_prompt != null) return submitIllustroFlux2(body, env);
     if (body.ltx_prompt != null) return submitFluxion(body, env);
     if (body.ltx_status) return statusFluxion(body, env);
     if (body.ace_prompt != null || body.pixazo_prompt != null) return submitSonariaAce(body, env);
     if (body.pexels_query != null) return pexels(body, env);
     if (body.tavily_query != null) return tavily(body, env);
-    if (body.github_oauth) return authGithub(body, env);
-    if (body.linear_oauth) return authLinear(body, env);
     if (body.action === 'tts') return handleTts(body);
 
     const wantGroq =
@@ -664,7 +558,6 @@ export default {
     if (wantGroq && !body.force_gemini && !body.force_vision && !body.has_image) {
       return relayGroq(body, env);
     }
-
     if (body.contents || body.force_gemini || body.force_vision || body.has_image || body.gemini_model) {
       return relayGemini(body, env);
     }

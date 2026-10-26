@@ -303,9 +303,13 @@ async function submitSonariaAce(body, env) {
   const payload = {
     model: 'acemusic/acestep-v15-turbo',
     messages: [{ role: 'user', content: prompt.slice(0, 500) }],
-    modalities: ['audio', 'text'],
+    sample_mode: true,
     task_type: 'text2music',
-    audio_duration: duration,
+    audio_config: {
+      duration: duration,
+      instrumental: true,
+      format: 'mp3',
+    },
   };
 
   const res = await fetch('https://api.acemusic.ai/v1/chat/completions', {
@@ -333,31 +337,25 @@ async function submitSonariaAce(body, env) {
     );
   }
 
-  let b64 = null;
   let audioUrl = null;
   try {
-    const choice = data.choices && data.choices[0];
-    const msg = choice && choice.message;
+    const msg = data.choices && data.choices[0] && data.choices[0].message;
     if (msg) {
-      if (typeof msg.audio === 'string') b64 = msg.audio;
-      else if (msg.audio && msg.audio.data) b64 = msg.audio.data;
-      else if (Array.isArray(msg.content)) {
-        for (const p of msg.content) {
-          if (p.type === 'output_audio' && p.audio && p.audio.data) b64 = p.audio.data;
-          if (p.type === 'audio' && p.data) b64 = p.data;
-        }
+      // Format officiel Ace : message.audio[0].audio_url.url
+      if (Array.isArray(msg.audio) && msg.audio.length) {
+        const a0 = msg.audio[0];
+        if (a0 && a0.audio_url && a0.audio_url.url) audioUrl = a0.audio_url.url;
+        else if (a0 && a0.url) audioUrl = a0.url;
+        else if (typeof a0 === 'string') audioUrl = a0;
+      } else if (msg.audio && msg.audio.data) {
+        audioUrl = 'data:audio/mpeg;base64,' + msg.audio.data;
+      } else if (typeof msg.audio === 'string') {
+        audioUrl = msg.audio.startsWith('data:') ? msg.audio : 'data:audio/mpeg;base64,' + msg.audio;
       }
     }
-    if (!b64 && data.audio_base64) b64 = data.audio_base64;
-    if (!b64 && data.audio) b64 = typeof data.audio === 'string' ? data.audio : data.audio.data;
-    if (data.audio_url) audioUrl = data.audio_url;
-    if (data.url && /\.(mp3|wav|ogg)/i.test(String(data.url))) audioUrl = data.url;
+    if (!audioUrl && data.audio_url) audioUrl = data.audio_url;
+    if (!audioUrl && data.audio_base64) audioUrl = 'data:audio/mpeg;base64,' + data.audio_base64;
   } catch (_) {}
-
-  if (!audioUrl && b64) {
-    b64 = String(b64).replace(/^data:audio\/[^;]+;base64,/, '');
-    audioUrl = 'data:audio/mpeg;base64,' + b64;
-  }
 
   if (!audioUrl) {
     return json({ error: 'Ace Music a répondu sans audio', raw: data }, 502);
@@ -369,7 +367,6 @@ async function submitSonariaAce(body, env) {
     status: 'COMPLETED',
     audio_url: audioUrl,
     url: audioUrl,
-    audio_base64: b64 || undefined,
   });
 }
 

@@ -67,88 +67,102 @@ function ipHeaders(env) {
   };
 }
 
-/* ---------- Illustro Engine (Flux 2 Workers AI) ---------- */
+/* ---------- Illustro Engine (Flux 2 Workers AI — multipart) ---------- */
 async function submitIllustroFlux2(body, env) {
   if (!env.AI) {
     return json({
-      error: 'Workers AI non lié — ajoute le binding AI (Settings → Bindings → Workers AI, nom: AI)',
+      error: 'Workers AI non lié — binding AI manquant',
     }, 500);
   }
 
   const prompt = String(body.illustro_prompt || body.prompt || '').trim();
   if (!prompt) return json({ error: 'illustro_prompt manquant' }, 400);
 
-  const width = Math.min(1024, Math.max(256, Number(body.width) || 1024));
-  const height = Math.min(1024, Math.max(256, Number(body.height) || 1024));
+  const width = String(Math.min(1024, Math.max(256, Number(body.width) || 1024)));
+  const height = String(Math.min(1024, Math.max(256, Number(body.height) || 1024)));
   const fullPrompt =
     prompt.slice(0, 900) + ', highly detailed, cinematic lighting, no text, no watermark';
 
-  const preferred = body.illustro_model_id ? [String(body.illustro_model_id)] : [];
-  const models = preferred.concat(ILLUSTRO_FLUX2_MODELS.filter((m) => m !== preferred[0]));
   const errors = [];
 
-  for (const model of models) {
+  // 1) Flux 2 famille = multipart obligatoire
+  const flux2Models = [
+    '@cf/black-forest-labs/flux-2-klein-4b',
+    '@cf/black-forest-labs/flux-2-dev',
+  ];
+
+  for (const model of flux2Models) {
     try {
+      const form = new FormData();
+      form.append('prompt', fullPrompt);
+      form.append('width', width);
+      form.append('height', height);
+
+      // Hack officiel CF : passer FormData via Request/Response
+      const formRequest = new Request('http://dummy', { method: 'POST', body: form });
+      const formStream = formRequest.body;
+      const formContentType = formRequest.headers.get('content-type') || 'multipart/form-data';
+
       const result = await env.AI.run(model, {
-        prompt: fullPrompt,
-        width,
-        height,
+        multipart: {
+          body: formStream,
+          contentType: formContentType,
+        },
       });
 
-      let imageUrl = null;
       let b64 = null;
-
       if (result && typeof result === 'object') {
-        if (typeof result.image === 'string') {
-          if (result.image.startsWith('http') || result.image.startsWith('data:')) {
-            imageUrl = result.image;
-          } else {
-            b64 = result.image;
-          }
-        } else if (result.result && result.result.image) {
-          const im = result.result.image;
-          if (typeof im === 'string' && (im.startsWith('http') || im.startsWith('data:'))) imageUrl = im;
-          else b64 = im;
-        } else if (result.image && result.image.data) {
-          b64 = result.image.data;
-        }
+        if (typeof result.image === 'string') b64 = result.image;
+        else if (result.result && typeof result.result.image === 'string') b64 = result.result.image;
       } else if (typeof result === 'string') {
-        if (result.startsWith('http') || result.startsWith('data:')) imageUrl = result;
-        else b64 = result;
+        b64 = result;
       }
 
-      if (!imageUrl && !b64 && (result instanceof ArrayBuffer || ArrayBuffer.isView(result))) {
-        const bytes = result instanceof ArrayBuffer ? new Uint8Array(result) : new Uint8Array(result.buffer);
-        let s = '';
-        for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-        b64 = btoa(s);
-      }
-
-      if (!imageUrl && b64) {
+      if (b64) {
         b64 = String(b64).replace(/^data:image\/[^;]+;base64,/, '');
-        imageUrl = 'data:image/jpeg;base64,' + b64;
-      }
-
-      if (imageUrl) {
+        const dataUrl = 'data:image/jpeg;base64,' + b64;
         return json({
           ok: true,
           provider: 'workers-ai-flux2',
           model,
-          image_url: imageUrl,
-          url: imageUrl,
+          image_url: dataUrl,
+          url: dataUrl,
         });
       }
-      errors.push({ model, error: 'réponse sans image' });
+      errors.push({ model, error: 'réponse sans image', keys: result && typeof result === 'object' ? Object.keys(result) : typeof result });
     } catch (e) {
       errors.push({ model, error: String(e.message || e) });
     }
   }
 
+  // 2) Secours Workers : Flux 1 schnell (JSON simple)
+  try {
+    const result = await env.AI.run('@cf/black-forest-labs/flux-1-schnell', {
+      prompt: fullPrompt,
+      seed: Math.floor(Math.random() * 1e9),
+    });
+    let b64 = result && result.image;
+    if (b64) {
+      b64 = String(b64).replace(/^data:image\/[^;]+;base64,/, '');
+      const dataUrl = 'data:image/jpeg;base64,' + b64;
+      return json({
+        ok: true,
+        provider: 'workers-ai-flux1',
+        model: '@cf/black-forest-labs/flux-1-schnell',
+        image_url: dataUrl,
+        url: dataUrl,
+      });
+    }
+    errors.push({ model: 'flux-1-schnell', error: 'sans image' });
+  } catch (e) {
+    errors.push({ model: 'flux-1-schnell', error: String(e.message || e) });
+  }
+
   return json(
     {
-      error: 'Aucun modèle Flux n\'a généré d\'image',
+      error: "Aucun modèle Flux n'a généré d'image",
       details: errors,
-      hint: 'Vérifie le binding AI + neurons Workers AI',
+      hint: 'multipart Flux2 + neurons Workers AI',
     },
     502
   );

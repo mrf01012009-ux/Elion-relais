@@ -412,41 +412,140 @@ export default {
     const action = body.action || body.type || url.pathname.replace(/^\//, '');
 
     try {
-      // Fluxion
-      if (
-        action === 'fluxion' ||
-        action === 'video' ||
-        body.fluxion_prompt ||
-        body.video_prompt
-      ) {
-        const prompt = body.prompt || body.fluxion_prompt || body.video_prompt || '';
-        const result = await runFluxion(prompt, body, env);
-        return json(result, result.ok ? 200 : 502);
+      // ── Fluxion (format app Elion : ltx_prompt / ltx_status) ──
+      if (body.ltx_prompt || body.fluxion_prompt || body.video_prompt) {
+        const prompt = body.ltx_prompt || body.fluxion_prompt || body.video_prompt || body.prompt || '';
+        const opts = {
+          duration: body.ltx_duration || body.duration || 5,
+          aspect: body.ltx_aspect || body.aspect || '16:9',
+          quality: body.ltx_quality || body.quality || '720p',
+          sound: body.ltx_sound !== false,
+        };
+
+        // Agnes submit → renvoie un id pour le poll de l'app
+        const agnes = await submitFluxionAgnes(prompt, opts, env);
+        if (agnes.ok) {
+          return json({
+            ok: true,
+            request_id: agnes.video_id,
+            id: agnes.video_id,
+            provider: 'agnes-flash',
+            status: 'queued',
+          });
+        }
+
+        // Fallback LTX immédiat (submit+poll côté worker si pas d'id async simple)
+        const ltx = await submitFluxionLtx(prompt, opts, env);
+        if (ltx.ok) {
+          return json({
+            ok: true,
+            request_id: 'done-' + Date.now(),
+            id: 'done-' + Date.now(),
+            provider: 'ltx',
+            status: 'COMPLETED',
+            video_url: ltx.url,
+            url: ltx.url,
+          });
+        }
+
+        return json({
+          ok: false,
+          error: agnes.error || ltx.error || 'Fluxion indisponible',
+        }, 502);
       }
 
-      // Sonaria
+      // Poll Fluxion (app envoie { ltx_status: id })
+      if (body.ltx_status) {
+        const id = String(body.ltx_status);
+        const provider = body.provider || '';
+
+        // Résultat déjà prêt (fallback LTX synchrone)
+        if (id.startsWith('done-')) {
+          return json({ ok: false, error: 'Job déjà terminé côté client', status: 'FAILED' }, 400);
+        }
+
+        // Poll Agnes
+        if (!provider || provider === 'agnes-flash' || id.startsWith('video_') || id.startsWith('task_')) {
+          const key = env.AGNES_API_KEY;
+          if (!key) return json({ error: 'AGNES_API_KEY manquante', status: 'FAILED' }, 500);
+
+          const pollUrl =
+            `\( {AGNES_BASE}/agnesapi?video_id= \){encodeURIComponent(id)}` +
+            `&model_name=${encodeURIComponent(AGNES_MODEL)}`;
+          const res = await fetch(pollUrl, {
+            headers: { Authorization: `Bearer ${key}` },
+          });
+          const data = await res.json().catch(() => ({}));
+          const status = String(data.status || '').toLowerCase();
+
+          if (['completed', 'succeeded', 'success', 'done'].includes(status)) {
+            const videoUrl = data.url || data.video_url || data.output?.url;
+            return json({
+              ok: true,
+              status: 'COMPLETED',
+              video_url: videoUrl,
+              url: videoUrl,
+              provider: 'agnes-flash',
+              raw: data,
+            });
+          }
+          if (['failed', 'error', 'cancelled'].includes(status)) {
+            return json({
+              ok: false,
+              status: 'FAILED',
+              error: data.error?.message || data.error || data.detail || 'Agnes failed',
+              raw: data,
+            });
+          }
+          // encore en cours
+          return json({
+            ok: true,
+            status: 'PROCESSING',
+            progress: data.progress || 0,
+            provider: 'agnes-flash',
+          });
+        }
+
+        // Poll LTX classique
+        const key = env.PIXAZO_API_KEY;
+        if (!key) return json({ error: 'PIXAZO_API_KEY manquante', status: 'FAILED' }, 500);
+        const res = await fetch(LTX_STATUS + encodeURIComponent(id), {
+          headers: { Authorization: `Bearer ${key}`, 'x-api-key': key },
+        });
+        const data = await res.json().catch(() => ({}));
+        const st = String(data.status || data.state || '').toLowerCase();
+        const videoUrl =
+          data.video_url || data.url || data.output?.url || data.result?.url ||
+          (Array.isArray(data.outputs) && data.outputs[0]?.url);
+
+        if (videoUrl && (st.includes('success') || st.includes('complete') || st === 'done')) {
+          return json({ ok: true, status: 'COMPLETED', video_url: videoUrl, url: videoUrl, provider: 'ltx' });
+        }
+        if (st.includes('fail') || st.includes('error')) {
+          return json({ ok: false, status: 'FAILED', error: data.message || data.error || 'LTX failed' });
+        }
+        return json({ ok: true, status: 'PROCESSING', provider: 'ltx' });
+      }
+
+      // Sonaria / Illustro / Chat (inchangé)
       if (action === 'sonaria' || action === 'audio' || body.sonaria_prompt || body.audio_prompt) {
         const prompt = body.prompt || body.sonaria_prompt || body.audio_prompt || '';
         const result = await runSonaria(prompt, body, env);
         return json(result, result.ok ? 200 : 502);
       }
 
-      // Illustro
       if (action === 'illustro' || action === 'image' || body.illustro_prompt || body.image_prompt) {
         const prompt = body.prompt || body.illustro_prompt || body.image_prompt || '';
         const result = await runIllustro(prompt, body, env);
         return json(result, result.ok ? 200 : 502);
       }
 
-      // Chat Groq
       if (action === 'chat' || action === 'groq' || body.messages) {
         const result = await runGroq(body.messages, env);
         return json(result, result.ok ? 200 : 502);
       }
 
-      return json({ error: 'Unknown action', action }, 400);
+      return json({ error: 'Unknown action', action, keys: Object.keys(body || {}) }, 400);
     } catch (e) {
       return json({ ok: false, error: e.message || String(e) }, 500);
     }
-  },
-};

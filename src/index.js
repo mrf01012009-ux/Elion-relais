@@ -1,15 +1,8 @@
 /**
- * ElionAI Relay — Cloudflare Worker
- *
- * Secrets :
- *   AGNES_API_KEY       → Fluxion (Agnes Video 2.5 Flash)
- *   PIXAZO_API_KEY      → LTX fallback + éventuellement Sonaria
- *   ACE_MUSIC_API_KEY   → Sonaria (Ace Music)
- *   GROQ_API_KEY
- *   GEMINI_API_KEY      (optionnel)
- *
- * Binding :
- *   AI                  → Workers AI (Illustro Flux family)
+ * ElionAI Relay — Cloudflare Worker (chat Gemini + médias)
+ * Secrets : AGNES_API_KEY, PIXAZO_API_KEY, ACE_MUSIC_API_KEY,
+ *           GROQ_API_KEY, GEMINI_API_KEY (ou GEMINI_API_KEY_2)
+ * Binding : AI (Illustro)
  */
 
 const CORS = {
@@ -20,16 +13,12 @@ const CORS = {
 
 const AGNES_BASE = 'https://apihub.agnes-ai.com';
 const AGNES_MODEL = 'agnes-video-2.5-flash';
-
 const LTX_SUBMIT = [
   'https://gateway.pixazo.ai/ltx-2-5-pro/v1/text-to-video',
   'https://gateway.pixazo.ai/ltx-2-5-lite/v1/text-to-video',
   'https://gateway.pixazo.ai/ltx-video/v1/text-to-video',
-  'https://gateway.pixazo.ai/ltx-2-3-text-to-video/v1/ltx-2-3-text-to-video-request',
 ];
 const LTX_STATUS = 'https://gateway.pixazo.ai/v2/requests/status/';
-
-/** Mets ici l’URL Ace qui marchait chez toi si différente */
 const ACE_CHAT_URL = 'https://api.ace-music.com/v1/chat/completions';
 
 function json(data, status = 200) {
@@ -38,15 +27,69 @@ function json(data, status = 200) {
     headers: { 'Content-Type': 'application/json', ...CORS },
   });
 }
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/* ═══════════════════════════════════════
-   FLUXION — Agnes Video 2.5 Flash
-═══════════════════════════════════════ */
+function pickGeminiKey(env) {
+  return env.GEMINI_API_KEY || env.GEMINI_API_KEY_2 || env.GEMINI_API_KEY_3 || '';
+}
 
+/* ─── Chat Gemini (ce que l’app envoie) ─── */
+async function proxyGemini(body, env) {
+  const key = pickGeminiKey(env);
+  if (!key) {
+    return json({ error: { message: 'GEMINI_API_KEY manquante' } }, 500);
+  }
+
+  const models = [
+    body.model,
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-1.5-flash',
+  ].filter(Boolean);
+
+  const payload = {
+    contents: body.contents || [],
+  };
+  if (body.system_instruction) payload.system_instruction = body.system_instruction;
+  if (body.generationConfig) payload.generationConfig = body.generationConfig;
+  if (body.tools) payload.tools = body.tools;
+  if (body.tool_config) payload.tool_config = body.tool_config;
+  if (body.safetySettings) payload.safetySettings = body.safetySettings;
+
+  let lastErr = 'Gemini failed';
+  let lastStatus = 502;
+
+  for (const model of models) {
+    const url =
+      'https://generativelanguage.googleapis.com/v1beta/models/' +
+      encodeURIComponent(model) +
+      ':generateContent?key=' +
+      encodeURIComponent(key);
+
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) return json(data, 200);
+      lastStatus = res.status;
+      lastErr =
+        data?.error?.message || data?.message || `Gemini HTTP ${res.status}`;
+      // clé / modèle invalide → essaie modèle suivant
+      if (res.status === 404 || res.status === 400) continue;
+      if (res.status === 429) return json(data, 429);
+    } catch (e) {
+      lastErr = e.message || String(e);
+    }
+  }
+  return json({ error: { message: lastErr } }, lastStatus || 502);
+}
+
+/* ─── Fluxion Agnes ─── */
 function mapAgnesSeconds(d) {
   const n = Number(d) || 5;
   if (n <= 4) return '4';
@@ -56,87 +99,58 @@ function mapAgnesSeconds(d) {
   if (n <= 10) return '10';
   return '12';
 }
-
 function mapAgnesAspect(fmt) {
   const f = String(fmt || '').toLowerCase();
-  if (f.includes('9:16') || f.includes('portrait') || f.includes('vertical')) return '9:16';
-  if (f.includes('1:1') || f.includes('square')) return '1:1';
-  if (f.includes('4:3')) return '4:3';
+  if (f.includes('9:16') || f.includes('portrait')) return '9:16';
+  if (f.includes('1:1')) return '1:1';
   return '16:9';
 }
 
 async function submitFluxionAgnes(prompt, opts, env) {
   const key = env.AGNES_API_KEY;
   if (!key) return { ok: false, error: 'AGNES_API_KEY manquante' };
-
-  const body = {
-    model: AGNES_MODEL,
-    prompt: String(prompt || '').slice(0, 2000),
-    mode: 'text',
-    seconds: mapAgnesSeconds(opts?.duration || opts?.seconds || 5),
-    size: '720P',
-    aspect_ratio: mapAgnesAspect(opts?.aspect || opts?.format || '16:9'),
-  };
-
   const res = await fetch(`${AGNES_BASE}/v1/videos`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${key}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      model: AGNES_MODEL,
+      prompt: String(prompt || '').slice(0, 2000),
+      mode: 'text',
+      seconds: mapAgnesSeconds(opts?.duration || 5),
+      size: '720P',
+      aspect_ratio: mapAgnesAspect(opts?.aspect || '16:9'),
+    }),
   });
-
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     return {
       ok: false,
       error: data.detail || data.error?.message || data.message || `Agnes HTTP ${res.status}`,
-      status: res.status,
       raw: data,
     };
   }
-
   const videoId = data.video_id || data.id;
   if (!videoId) return { ok: false, error: 'Agnes: pas de video_id', raw: data };
-
-  return {
-    ok: true,
-    provider: 'agnes-flash',
-    video_id: videoId,
-    task_id: data.task_id || data.id || videoId,
-  };
+  return { ok: true, provider: 'agnes-flash', video_id: videoId };
 }
 
 async function pollAgnesOnce(videoId, env) {
   const key = env.AGNES_API_KEY;
   if (!key) return { ok: false, status: 'FAILED', error: 'AGNES_API_KEY manquante' };
-
   const url =
     `\( {AGNES_BASE}/agnesapi?video_id= \){encodeURIComponent(videoId)}` +
     `&model_name=${encodeURIComponent(AGNES_MODEL)}`;
-
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${key}` },
-  });
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${key}` } });
   const data = await res.json().catch(() => ({}));
   const status = String(data.status || '').toLowerCase();
-
   if (['completed', 'succeeded', 'success', 'done'].includes(status)) {
-    const videoUrl = data.url || data.video_url || data.output?.url;
-    if (!videoUrl) {
-      return { ok: false, status: 'FAILED', error: 'Agnes completed sans url', raw: data };
-    }
-    return {
-      ok: true,
-      status: 'COMPLETED',
-      video_url: videoUrl,
-      url: videoUrl,
-      provider: 'agnes-flash',
-      raw: data,
-    };
+    const videoUrl = data.url || data.video_url;
+    if (!videoUrl) return { ok: false, status: 'FAILED', error: 'sans url', raw: data };
+    return { ok: true, status: 'COMPLETED', video_url: videoUrl, url: videoUrl, provider: 'agnes-flash' };
   }
-
   if (['failed', 'error', 'cancelled'].includes(status)) {
     return {
       ok: false,
@@ -145,28 +159,16 @@ async function pollAgnesOnce(videoId, env) {
       raw: data,
     };
   }
-
-  return {
-    ok: true,
-    status: 'PROCESSING',
-    progress: data.progress || 0,
-    provider: 'agnes-flash',
-  };
+  return { ok: true, status: 'PROCESSING', progress: data.progress || 0, provider: 'agnes-flash' };
 }
-
-/* ═══════════════════════════════════════
-   FLUXION — LTX (Pixazo) fallback
-═══════════════════════════════════════ */
 
 async function submitFluxionLtx(prompt, opts, env) {
   const key = env.PIXAZO_API_KEY;
   if (!key) return { ok: false, error: 'PIXAZO_API_KEY manquante' };
-
   const payload = {
     prompt: String(prompt || '').slice(0, 1500),
     duration: Math.min(8, Math.max(3, Number(opts?.duration) || 5)),
   };
-
   let lastErr = 'LTX unavailable';
   for (const endpoint of LTX_SUBMIT) {
     try {
@@ -184,8 +186,7 @@ async function submitFluxionLtx(prompt, opts, env) {
         lastErr = data.message || data.error || `LTX HTTP ${res.status}`;
         continue;
       }
-      const requestId =
-        data.request_id || data.id || data.job_id || data.data?.request_id;
+      const requestId = data.request_id || data.id || data.job_id || data.data?.request_id;
       if (!requestId) {
         lastErr = 'LTX: pas de request_id';
         continue;
@@ -201,228 +202,105 @@ async function submitFluxionLtx(prompt, opts, env) {
 async function pollLtxOnce(requestId, env) {
   const key = env.PIXAZO_API_KEY;
   if (!key) return { ok: false, status: 'FAILED', error: 'PIXAZO_API_KEY manquante' };
-
   const res = await fetch(LTX_STATUS + encodeURIComponent(requestId), {
-    headers: {
-      Authorization: `Bearer ${key}`,
-      'x-api-key': key,
-    },
+    headers: { Authorization: `Bearer ${key}`, 'x-api-key': key },
   });
   const data = await res.json().catch(() => ({}));
   const st = String(data.status || data.state || '').toLowerCase();
   const videoUrl =
-    data.video_url ||
-    data.url ||
-    data.output?.url ||
-    data.result?.url ||
+    data.video_url || data.url || data.output?.url || data.result?.url ||
     (Array.isArray(data.outputs) && data.outputs[0]?.url);
-
   if (videoUrl && (st.includes('success') || st.includes('complete') || st === 'done')) {
-    return {
-      ok: true,
-      status: 'COMPLETED',
-      video_url: videoUrl,
-      url: videoUrl,
-      provider: 'ltx',
-    };
+    return { ok: true, status: 'COMPLETED', video_url: videoUrl, url: videoUrl, provider: 'ltx' };
   }
   if (st.includes('fail') || st.includes('error')) {
-    return {
-      ok: false,
-      status: 'FAILED',
-      error: data.message || data.error || 'LTX failed',
-      raw: data,
-    };
+    return { ok: false, status: 'FAILED', error: data.message || data.error || 'LTX failed' };
   }
   return { ok: true, status: 'PROCESSING', provider: 'ltx' };
 }
 
-/* ═══════════════════════════════════════
-   SONARIA — Ace Music
-═══════════════════════════════════════ */
-
+/* ─── Sonaria / Illustro (résumé) ─── */
 async function runSonaria(prompt, opts, env) {
   const key = env.ACE_MUSIC_API_KEY || env.PIXAZO_API_KEY;
   if (!key) return { ok: false, error: 'ACE_MUSIC_API_KEY manquante' };
-
-  const duration = Math.min(35, Math.max(5, Number(opts?.duration) || 15));
-
+  const duration = Math.min(35, Math.max(5, Number(opts?.duration || opts?.ace_duration) || 15));
   const res = await fetch(ACE_CHAT_URL, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${key}`,
-      'Content-Type': 'application/json',
-    },
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model: 'ace-music',
       messages: [{ role: 'user', content: String(prompt || '').slice(0, 1500) }],
       task_type: 'text2music',
-      audio_config: {
-        duration,
-        instrumental: opts?.instrumental !== false,
-        format: 'mp3',
-      },
+      audio_config: { duration, instrumental: true, format: 'mp3' },
     }),
   });
-
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    return {
-      ok: false,
-      error: data.error?.message || data.message || `Ace HTTP ${res.status}`,
-      raw: data,
-    };
+    return { ok: false, error: data.error?.message || data.message || `Ace HTTP ${res.status}` };
   }
-
   const audioUrl =
     data.choices?.[0]?.message?.audio?.[0]?.audio_url?.url ||
     data.choices?.[0]?.message?.audio_url ||
     data.audio_url ||
     data.url;
-
-  if (!audioUrl) {
-    return { ok: false, error: 'Ace Music a répondu sans audio', raw: data };
-  }
-  return { ok: true, provider: 'ace-music', url: audioUrl, raw: data };
+  if (!audioUrl) return { ok: false, error: 'Ace sans audio', raw: data };
+  return { ok: true, url: audioUrl, provider: 'ace-music' };
 }
 
-/* ═══════════════════════════════════════
-   ILLUSTRO — Workers AI Flux family
-═══════════════════════════════════════ */
-
 async function runIllustro(prompt, opts, env) {
-  if (!env.AI) return { ok: false, error: 'Workers AI non lié (binding AI)' };
-
+  if (!env.AI) return { ok: false, error: 'Workers AI non lié' };
   const p = String(prompt || '').slice(0, 2000);
   const width = Number(opts?.width) || 1024;
   const height = Number(opts?.height) || 1024;
-  const useFlux2 = opts?.engine !== 'schnell' && opts?.tier !== 'schnell';
-
-  const flux2Models = [
+  const models = [
     '@cf/black-forest-labs/flux-2-klein-4b',
-    '@cf/black-forest-labs/flux-2-dev',
+    '@cf/black-forest-labs/flux-1-schnell',
   ];
-  const schnell = '@cf/black-forest-labs/flux-1-schnell';
-
-  async function tryModel(model, multipart) {
-    if (multipart) {
-      const form = new FormData();
-      form.append('prompt', p);
-      form.append('width', String(width));
-      form.append('height', String(height));
-      return env.AI.run(model, form);
-    }
-    return env.AI.run(model, { prompt: p, width, height });
-  }
-
   let lastErr = 'Illustro failed';
-
-  if (useFlux2) {
-    for (const model of flux2Models) {
-      try {
-        const r = await tryModel(model, true);
-        const b64 = r?.image || r?.images?.[0] || (typeof r === 'string' ? r : null);
-        if (b64) {
-          return {
-            ok: true,
-            provider: 'flux-2',
-            model,
-            image: typeof b64 === 'string' ? b64 : null,
-            raw: r,
-          };
-        }
-      } catch (e) {
-        lastErr = e.message || String(e);
+  for (let i = 0; i < models.length; i++) {
+    try {
+      let r;
+      if (i === 0) {
+        const form = new FormData();
+        form.append('prompt', p);
+        form.append('width', String(width));
+        form.append('height', String(height));
+        r = await env.AI.run(models[i], form);
+      } else {
+        r = await env.AI.run(models[i], { prompt: p });
       }
+      const b64 = r?.image || r?.images?.[0];
+      if (b64) return { ok: true, image: b64, provider: models[i] };
+    } catch (e) {
+      lastErr = e.message || String(e);
     }
   }
-
-  try {
-    const r = await tryModel(schnell, false);
-    const b64 = r?.image || r?.images?.[0] || (typeof r === 'string' ? r : null);
-    if (b64) {
-      return {
-        ok: true,
-        provider: 'flux-1-schnell',
-        model: schnell,
-        image: typeof b64 === 'string' ? b64 : null,
-        warning: useFlux2 ? 'fallback_schnell' : undefined,
-        raw: r,
-      };
-    }
-  } catch (e) {
-    lastErr = e.message || String(e);
-  }
-
   return { ok: false, error: lastErr };
 }
-
-/* ═══════════════════════════════════════
-   CHAT — Groq
-═══════════════════════════════════════ */
-
-async function runGroq(messages, env) {
-  const key = env.GROQ_API_KEY;
-  if (!key) return { ok: false, error: 'GROQ_API_KEY manquante' };
-
-  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${key}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
-      messages: messages || [],
-      temperature: 0.7,
-    }),
-  });
-
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    return {
-      ok: false,
-      error: data.error?.message || `Groq HTTP ${res.status}`,
-      raw: data,
-    };
-  }
-  return {
-    ok: true,
-    text: data.choices?.[0]?.message?.content || '',
-    raw: data,
-  };
-}
-
-/* ═══════════════════════════════════════
-   ROUTER
-═══════════════════════════════════════ */
 
 export default {
   async fetch(request, env) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: CORS });
     }
-
     const url = new URL(request.url);
 
-    // Health
-    if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
+    if (request.method === 'GET') {
       return json({
         ok: true,
         service: 'elion-relay',
+        chat: pickGeminiKey(env) ? 'gemini' : 'off',
         fluxion: env.AGNES_API_KEY ? 'agnes-video-2.5-flash' : 'off',
         fluxion_fallback: env.PIXAZO_API_KEY ? 'ltx' : 'off',
-        sonaria: env.ACE_MUSIC_API_KEY || env.PIXAZO_API_KEY ? 'ace-music' : 'off',
-        illustro: env.AI ? 'flux-2-family' : 'off',
+        sonaria: env.ACE_MUSIC_API_KEY || env.PIXAZO_API_KEY ? 'ace' : 'off',
+        illustro: env.AI ? 'flux' : 'off',
         has_ai_binding: !!env.AI,
         has_agnes: !!env.AGNES_API_KEY,
-        has_groq: !!env.GROQ_API_KEY,
+        has_gemini: !!pickGeminiKey(env),
       });
     }
 
-    if (request.method !== 'POST') {
-      return json({ error: 'Method not allowed' }, 405);
-    }
+    if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
 
     let body = {};
     try {
@@ -431,141 +309,105 @@ export default {
       return json({ error: 'Invalid JSON' }, 400);
     }
 
-    const action = body.action || body.type || '';
-
     try {
-      /* ── Fluxion SUBMIT (format app : ltx_prompt) ── */
-      if (
-        body.ltx_prompt ||
-        body.fluxion_prompt ||
-        body.video_prompt ||
-        action === 'fluxion' ||
-        action === 'video'
-      ) {
-        const prompt =
-          body.ltx_prompt ||
-          body.fluxion_prompt ||
-          body.video_prompt ||
-          body.prompt ||
-          '';
+      /* Fluxion submit */
+      if (body.ltx_prompt || body.fluxion_prompt || body.video_prompt) {
+        const prompt = body.ltx_prompt || body.fluxion_prompt || body.video_prompt || body.prompt || '';
         const opts = {
-          duration: body.ltx_duration || body.duration || body.seconds || 5,
-          aspect: body.ltx_aspect || body.aspect || body.format || '16:9',
-          quality: body.ltx_quality || body.quality || '720p',
-          sound: body.ltx_sound !== false,
+          duration: body.ltx_duration || body.duration || 5,
+          aspect: body.ltx_aspect || body.aspect || '16:9',
         };
-
-        // 1) Agnes
         const agnes = await submitFluxionAgnes(prompt, opts, env);
         if (agnes.ok) {
           return json({
             ok: true,
             request_id: agnes.video_id,
-            requestId: agnes.video_id,
             id: agnes.video_id,
             provider: 'agnes-flash',
             status: 'queued',
           });
         }
-
-        // 2) LTX fallback
+        const err = String(agnes.error || '').toLowerCase();
+        // queue full / rate → LTX
         const ltx = await submitFluxionLtx(prompt, opts, env);
         if (ltx.ok) {
           return json({
             ok: true,
             request_id: ltx.request_id,
-            requestId: ltx.request_id,
             id: ltx.request_id,
             provider: 'ltx',
             status: 'queued',
+            agnes_error: agnes.error,
           });
         }
-
-        return json(
-          {
-            ok: false,
-            error: agnes.error || ltx.error || 'Fluxion indisponible',
-          },
-          502
-        );
+        return json({ ok: false, error: agnes.error || ltx.error }, 502);
       }
 
-      /* ── Fluxion POLL (format app : ltx_status) ── */
+      /* Fluxion poll */
       if (body.ltx_status) {
         const id = String(body.ltx_status);
         const provider = String(body.provider || '');
-
-        // Agnes si provider explicite ou id typique
-        const looksAgnes =
-          provider === 'agnes-flash' ||
-          id.startsWith('video_') ||
-          id.startsWith('task_') ||
-          !provider;
-
-        if (looksAgnes && env.AGNES_API_KEY) {
+        if (provider === 'ltx') return json(await pollLtxOnce(id, env));
+        if (env.AGNES_API_KEY) {
           const once = await pollAgnesOnce(id, env);
-          // Si Agnes dit task not found et provider vide, tente LTX
           if (
             once.status === 'FAILED' &&
-            !provider &&
             env.PIXAZO_API_KEY &&
-            String(once.error || '').toLowerCase().includes('not found')
+            /not found/i.test(String(once.error || ''))
           ) {
             return json(await pollLtxOnce(id, env));
           }
-          return json(once, once.status === 'FAILED' ? 200 : 200);
+          return json(once);
         }
-
-        if (env.PIXAZO_API_KEY) {
-          return json(await pollLtxOnce(id, env));
-        }
-
-        return json({ ok: false, status: 'FAILED', error: 'Aucun provider poll' }, 500);
+        if (env.PIXAZO_API_KEY) return json(await pollLtxOnce(id, env));
+        return json({ status: 'FAILED', error: 'no poll provider' }, 500);
       }
 
-      /* ── Sonaria ── */
-      if (
-        action === 'sonaria' ||
-        action === 'audio' ||
-        body.sonaria_prompt ||
-        body.audio_prompt ||
-        body.ace_prompt
-      ) {
-        const prompt =
-          body.prompt || body.sonaria_prompt || body.audio_prompt || body.ace_prompt || '';
+      /* Sonaria */
+      if (body.ace_prompt || body.sonaria_prompt || body.audio_prompt) {
+        const prompt = body.ace_prompt || body.sonaria_prompt || body.audio_prompt || body.prompt || '';
         const result = await runSonaria(prompt, body, env);
         return json(result, result.ok ? 200 : 502);
       }
 
-      /* ── Illustro ── */
-      if (
-        action === 'illustro' ||
-        action === 'image' ||
-        body.illustro_prompt ||
-        body.image_prompt
-      ) {
-        const prompt =
-          body.prompt || body.illustro_prompt || body.image_prompt || '';
+      /* Illustro */
+      if (body.illustro_prompt || body.image_prompt) {
+        const prompt = body.illustro_prompt || body.image_prompt || body.prompt || '';
         const result = await runIllustro(prompt, body, env);
         return json(result, result.ok ? 200 : 502);
       }
 
-      /* ── Chat Groq ── */
-      if (action === 'chat' || action === 'groq' || Array.isArray(body.messages)) {
-        const result = await runGroq(body.messages, env);
-        return json(result, result.ok ? 200 : 502);
+      /* CHAT — payload Gemini de l’app (contents / system_instruction) */
+      if (
+        Array.isArray(body.contents) ||
+        body.system_instruction ||
+        body.force_gemini ||
+        body.force_vision ||
+        body.has_image
+      ) {
+        return proxyGemini(body, env);
       }
 
-      return json(
-        {
-          error: 'Unknown action',
-          action,
-          keys: Object.keys(body || {}),
-        },
-        400
-      );
+      /* Groq optionnel */
+      if (Array.isArray(body.messages) && env.GROQ_API_KEY) {
+        const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${env.GROQ_API_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: 'llama-3.3-70b-versatile',
+            messages: body.messages,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        return json(data, res.status);
+      }
+
+      return json({ error: 'Unknown action', keys: Object.keys(body || {}) }, 400);
     } catch (e) {
-      return json({ ok: false, error: e.message || String(e) }, 500);
+      return json({ error: { message: e.message || String(e) } }, 500);
     }
   },
 };

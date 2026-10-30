@@ -1,14 +1,15 @@
 /**
  * ElionAI Relay — Cloudflare Worker
- * Secrets / vars :
- *   AGNES_API_KEY          (Fluxion principal — Agnes Video 2.5 Flash)
- *   PIXAZO_API_KEY         (Sonaria + fallback LTX)
- *   ACE_MUSIC_API_KEY      (Sonaria Ace Music)
+ *
+ * Secrets :
+ *   AGNES_API_KEY       → Fluxion (Agnes Video 2.5 Flash)
+ *   PIXAZO_API_KEY      → LTX fallback + éventuellement Sonaria
+ *   ACE_MUSIC_API_KEY   → Sonaria (Ace Music)
  *   GROQ_API_KEY
- *   GEMINI_API_KEY
- *   TAVILY_API_KEY, PEXELS_API_KEY (optionnel)
+ *   GEMINI_API_KEY      (optionnel)
+ *
  * Binding :
- *   AI                     (Workers AI — Illustro Flux family)
+ *   AI                  → Workers AI (Illustro Flux family)
  */
 
 const CORS = {
@@ -28,7 +29,8 @@ const LTX_SUBMIT = [
 ];
 const LTX_STATUS = 'https://gateway.pixazo.ai/v2/requests/status/';
 
-const ACE_BASE = 'https://api.ace-music.com'; // ajuste si ton endpoint Ace diffère
+/** Mets ici l’URL Ace qui marchait chez toi si différente */
+const ACE_CHAT_URL = 'https://api.ace-music.com/v1/chat/completions';
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -41,7 +43,9 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/* ───────── Fluxion: Agnes 2.5 Flash ───────── */
+/* ═══════════════════════════════════════
+   FLUXION — Agnes Video 2.5 Flash
+═══════════════════════════════════════ */
 
 function mapAgnesSeconds(d) {
   const n = Number(d) || 5;
@@ -104,39 +108,55 @@ async function submitFluxionAgnes(prompt, opts, env) {
   };
 }
 
-async function pollFluxionAgnes(videoId, env, maxTries = 90) {
+async function pollAgnesOnce(videoId, env) {
   const key = env.AGNES_API_KEY;
-  if (!key) return { ok: false, error: 'AGNES_API_KEY manquante' };
+  if (!key) return { ok: false, status: 'FAILED', error: 'AGNES_API_KEY manquante' };
 
-  for (let i = 0; i < maxTries; i++) {
-    const url =
-      `\( {AGNES_BASE}/agnesapi?video_id= \){encodeURIComponent(videoId)}` +
-      `&model_name=${encodeURIComponent(AGNES_MODEL)}`;
+  const url =
+    `\( {AGNES_BASE}/agnesapi?video_id= \){encodeURIComponent(videoId)}` +
+    `&model_name=${encodeURIComponent(AGNES_MODEL)}`;
 
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${key}` },
-    });
-    const data = await res.json().catch(() => ({}));
-    const status = String(data.status || '').toLowerCase();
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${key}` },
+  });
+  const data = await res.json().catch(() => ({}));
+  const status = String(data.status || '').toLowerCase();
 
-    if (['completed', 'succeeded', 'success', 'done'].includes(status)) {
-      const videoUrl = data.url || data.video_url || data.output?.url;
-      if (!videoUrl) return { ok: false, error: 'Agnes completed sans url', raw: data };
-      return { ok: true, provider: 'agnes-flash', url: videoUrl, raw: data };
+  if (['completed', 'succeeded', 'success', 'done'].includes(status)) {
+    const videoUrl = data.url || data.video_url || data.output?.url;
+    if (!videoUrl) {
+      return { ok: false, status: 'FAILED', error: 'Agnes completed sans url', raw: data };
     }
-    if (['failed', 'error', 'cancelled'].includes(status)) {
-      return {
-        ok: false,
-        error: data.error?.message || data.error || data.detail || 'Agnes failed',
-        raw: data,
-      };
-    }
-    await sleep(1500);
+    return {
+      ok: true,
+      status: 'COMPLETED',
+      video_url: videoUrl,
+      url: videoUrl,
+      provider: 'agnes-flash',
+      raw: data,
+    };
   }
-  return { ok: false, error: 'Agnes timeout' };
+
+  if (['failed', 'error', 'cancelled'].includes(status)) {
+    return {
+      ok: false,
+      status: 'FAILED',
+      error: data.error?.message || data.error || data.detail || 'Agnes failed',
+      raw: data,
+    };
+  }
+
+  return {
+    ok: true,
+    status: 'PROCESSING',
+    progress: data.progress || 0,
+    provider: 'agnes-flash',
+  };
 }
 
-/* ───────── Fluxion: LTX (Pixazo) fallback ───────── */
+/* ═══════════════════════════════════════
+   FLUXION — LTX (Pixazo) fallback
+═══════════════════════════════════════ */
 
 async function submitFluxionLtx(prompt, opts, env) {
   const key = env.PIXAZO_API_KEY;
@@ -170,7 +190,7 @@ async function submitFluxionLtx(prompt, opts, env) {
         lastErr = 'LTX: pas de request_id';
         continue;
       }
-      return pollFluxionLtx(requestId, env);
+      return { ok: true, provider: 'ltx', request_id: requestId };
     } catch (e) {
       lastErr = e.message || String(e);
     }
@@ -178,53 +198,48 @@ async function submitFluxionLtx(prompt, opts, env) {
   return { ok: false, error: lastErr };
 }
 
-async function pollFluxionLtx(requestId, env, maxTries = 60) {
+async function pollLtxOnce(requestId, env) {
   const key = env.PIXAZO_API_KEY;
-  for (let i = 0; i < maxTries; i++) {
-    const res = await fetch(LTX_STATUS + encodeURIComponent(requestId), {
-      headers: {
-        Authorization: `Bearer ${key}`,
-        'x-api-key': key,
-      },
-    });
-    const data = await res.json().catch(() => ({}));
-    const status = String(data.status || data.state || '').toLowerCase();
-    const url =
-      data.video_url ||
-      data.url ||
-      data.output?.url ||
-      data.result?.url ||
-      (Array.isArray(data.outputs) && data.outputs[0]?.url);
+  if (!key) return { ok: false, status: 'FAILED', error: 'PIXAZO_API_KEY manquante' };
 
-    if (url && (status.includes('success') || status.includes('complete') || status === 'done')) {
-      return { ok: true, provider: 'ltx', url, raw: data };
-    }
-    if (status.includes('fail') || status.includes('error')) {
-      return { ok: false, error: data.message || data.error || 'LTX failed', raw: data };
-    }
-    await sleep(2000);
+  const res = await fetch(LTX_STATUS + encodeURIComponent(requestId), {
+    headers: {
+      Authorization: `Bearer ${key}`,
+      'x-api-key': key,
+    },
+  });
+  const data = await res.json().catch(() => ({}));
+  const st = String(data.status || data.state || '').toLowerCase();
+  const videoUrl =
+    data.video_url ||
+    data.url ||
+    data.output?.url ||
+    data.result?.url ||
+    (Array.isArray(data.outputs) && data.outputs[0]?.url);
+
+  if (videoUrl && (st.includes('success') || st.includes('complete') || st === 'done')) {
+    return {
+      ok: true,
+      status: 'COMPLETED',
+      video_url: videoUrl,
+      url: videoUrl,
+      provider: 'ltx',
+    };
   }
-  return { ok: false, error: 'LTX timeout' };
+  if (st.includes('fail') || st.includes('error')) {
+    return {
+      ok: false,
+      status: 'FAILED',
+      error: data.message || data.error || 'LTX failed',
+      raw: data,
+    };
+  }
+  return { ok: true, status: 'PROCESSING', provider: 'ltx' };
 }
 
-/** Fluxion: Agnes → LTX */
-async function runFluxion(prompt, opts, env) {
-  const agnesSubmit = await submitFluxionAgnes(prompt, opts, env);
-  if (agnesSubmit.ok) {
-    const done = await pollFluxionAgnes(agnesSubmit.video_id, env);
-    if (done.ok) return done;
-  }
-
-  const ltx = await submitFluxionLtx(prompt, opts, env);
-  if (ltx.ok) return ltx;
-
-  return {
-    ok: false,
-    error: agnesSubmit.error || ltx.error || 'Fluxion indisponible',
-  };
-}
-
-/* ───────── Sonaria: Ace Music ───────── */
+/* ═══════════════════════════════════════
+   SONARIA — Ace Music
+═══════════════════════════════════════ */
 
 async function runSonaria(prompt, opts, env) {
   const key = env.ACE_MUSIC_API_KEY || env.PIXAZO_API_KEY;
@@ -232,8 +247,7 @@ async function runSonaria(prompt, opts, env) {
 
   const duration = Math.min(35, Math.max(5, Number(opts?.duration) || 15));
 
-  // Payload type chat/completions audio — adapte si ton Ace endpoint diffère
-  const res = await fetch(`${ACE_BASE}/v1/chat/completions`, {
+  const res = await fetch(ACE_CHAT_URL, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${key}`,
@@ -272,7 +286,9 @@ async function runSonaria(prompt, opts, env) {
   return { ok: true, provider: 'ace-music', url: audioUrl, raw: data };
 }
 
-/* ───────── Illustro: Workers AI Flux family ───────── */
+/* ═══════════════════════════════════════
+   ILLUSTRO — Workers AI Flux family
+═══════════════════════════════════════ */
 
 async function runIllustro(prompt, opts, env) {
   if (!env.AI) return { ok: false, error: 'Workers AI non lié (binding AI)' };
@@ -294,21 +310,18 @@ async function runIllustro(prompt, opts, env) {
       form.append('prompt', p);
       form.append('width', String(width));
       form.append('height', String(height));
-      const r = await env.AI.run(model, form);
-      return r;
+      return env.AI.run(model, form);
     }
     return env.AI.run(model, { prompt: p, width, height });
   }
 
   let lastErr = 'Illustro failed';
+
   if (useFlux2) {
     for (const model of flux2Models) {
       try {
         const r = await tryModel(model, true);
-        const b64 =
-          r?.image ||
-          r?.images?.[0] ||
-          (typeof r === 'string' ? r : null);
+        const b64 = r?.image || r?.images?.[0] || (typeof r === 'string' ? r : null);
         if (b64) {
           return {
             ok: true,
@@ -344,7 +357,9 @@ async function runIllustro(prompt, opts, env) {
   return { ok: false, error: lastErr };
 }
 
-/* ───────── Chat: Groq ───────── */
+/* ═══════════════════════════════════════
+   CHAT — Groq
+═══════════════════════════════════════ */
 
 async function runGroq(messages, env) {
   const key = env.GROQ_API_KEY;
@@ -362,9 +377,14 @@ async function runGroq(messages, env) {
       temperature: 0.7,
     }),
   });
+
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    return { ok: false, error: data.error?.message || `Groq HTTP ${res.status}`, raw: data };
+    return {
+      ok: false,
+      error: data.error?.message || `Groq HTTP ${res.status}`,
+      raw: data,
+    };
   }
   return {
     ok: true,
@@ -373,7 +393,9 @@ async function runGroq(messages, env) {
   };
 }
 
-/* ───────── Router ───────── */
+/* ═══════════════════════════════════════
+   ROUTER
+═══════════════════════════════════════ */
 
 export default {
   async fetch(request, env) {
@@ -409,143 +431,141 @@ export default {
       return json({ error: 'Invalid JSON' }, 400);
     }
 
-    const action = body.action || body.type || url.pathname.replace(/^\//, '');
+    const action = body.action || body.type || '';
 
     try {
-      // ── Fluxion (format app Elion : ltx_prompt / ltx_status) ──
-      if (body.ltx_prompt || body.fluxion_prompt || body.video_prompt) {
-        const prompt = body.ltx_prompt || body.fluxion_prompt || body.video_prompt || body.prompt || '';
+      /* ── Fluxion SUBMIT (format app : ltx_prompt) ── */
+      if (
+        body.ltx_prompt ||
+        body.fluxion_prompt ||
+        body.video_prompt ||
+        action === 'fluxion' ||
+        action === 'video'
+      ) {
+        const prompt =
+          body.ltx_prompt ||
+          body.fluxion_prompt ||
+          body.video_prompt ||
+          body.prompt ||
+          '';
         const opts = {
-          duration: body.ltx_duration || body.duration || 5,
-          aspect: body.ltx_aspect || body.aspect || '16:9',
+          duration: body.ltx_duration || body.duration || body.seconds || 5,
+          aspect: body.ltx_aspect || body.aspect || body.format || '16:9',
           quality: body.ltx_quality || body.quality || '720p',
           sound: body.ltx_sound !== false,
         };
 
-        // Agnes submit → renvoie un id pour le poll de l'app
+        // 1) Agnes
         const agnes = await submitFluxionAgnes(prompt, opts, env);
         if (agnes.ok) {
           return json({
             ok: true,
             request_id: agnes.video_id,
+            requestId: agnes.video_id,
             id: agnes.video_id,
             provider: 'agnes-flash',
             status: 'queued',
           });
         }
 
-        // Fallback LTX immédiat (submit+poll côté worker si pas d'id async simple)
+        // 2) LTX fallback
         const ltx = await submitFluxionLtx(prompt, opts, env);
         if (ltx.ok) {
           return json({
             ok: true,
-            request_id: 'done-' + Date.now(),
-            id: 'done-' + Date.now(),
+            request_id: ltx.request_id,
+            requestId: ltx.request_id,
+            id: ltx.request_id,
             provider: 'ltx',
-            status: 'COMPLETED',
-            video_url: ltx.url,
-            url: ltx.url,
+            status: 'queued',
           });
         }
 
-        return json({
-          ok: false,
-          error: agnes.error || ltx.error || 'Fluxion indisponible',
-        }, 502);
+        return json(
+          {
+            ok: false,
+            error: agnes.error || ltx.error || 'Fluxion indisponible',
+          },
+          502
+        );
       }
 
-      // Poll Fluxion (app envoie { ltx_status: id })
+      /* ── Fluxion POLL (format app : ltx_status) ── */
       if (body.ltx_status) {
         const id = String(body.ltx_status);
-        const provider = body.provider || '';
+        const provider = String(body.provider || '');
 
-        // Résultat déjà prêt (fallback LTX synchrone)
-        if (id.startsWith('done-')) {
-          return json({ ok: false, error: 'Job déjà terminé côté client', status: 'FAILED' }, 400);
-        }
+        // Agnes si provider explicite ou id typique
+        const looksAgnes =
+          provider === 'agnes-flash' ||
+          id.startsWith('video_') ||
+          id.startsWith('task_') ||
+          !provider;
 
-        // Poll Agnes
-        if (!provider || provider === 'agnes-flash' || id.startsWith('video_') || id.startsWith('task_')) {
-          const key = env.AGNES_API_KEY;
-          if (!key) return json({ error: 'AGNES_API_KEY manquante', status: 'FAILED' }, 500);
-
-          const pollUrl =
-            `\( {AGNES_BASE}/agnesapi?video_id= \){encodeURIComponent(id)}` +
-            `&model_name=${encodeURIComponent(AGNES_MODEL)}`;
-          const res = await fetch(pollUrl, {
-            headers: { Authorization: `Bearer ${key}` },
-          });
-          const data = await res.json().catch(() => ({}));
-          const status = String(data.status || '').toLowerCase();
-
-          if (['completed', 'succeeded', 'success', 'done'].includes(status)) {
-            const videoUrl = data.url || data.video_url || data.output?.url;
-            return json({
-              ok: true,
-              status: 'COMPLETED',
-              video_url: videoUrl,
-              url: videoUrl,
-              provider: 'agnes-flash',
-              raw: data,
-            });
+        if (looksAgnes && env.AGNES_API_KEY) {
+          const once = await pollAgnesOnce(id, env);
+          // Si Agnes dit task not found et provider vide, tente LTX
+          if (
+            once.status === 'FAILED' &&
+            !provider &&
+            env.PIXAZO_API_KEY &&
+            String(once.error || '').toLowerCase().includes('not found')
+          ) {
+            return json(await pollLtxOnce(id, env));
           }
-          if (['failed', 'error', 'cancelled'].includes(status)) {
-            return json({
-              ok: false,
-              status: 'FAILED',
-              error: data.error?.message || data.error || data.detail || 'Agnes failed',
-              raw: data,
-            });
-          }
-          // encore en cours
-          return json({
-            ok: true,
-            status: 'PROCESSING',
-            progress: data.progress || 0,
-            provider: 'agnes-flash',
-          });
+          return json(once, once.status === 'FAILED' ? 200 : 200);
         }
 
-        // Poll LTX classique
-        const key = env.PIXAZO_API_KEY;
-        if (!key) return json({ error: 'PIXAZO_API_KEY manquante', status: 'FAILED' }, 500);
-        const res = await fetch(LTX_STATUS + encodeURIComponent(id), {
-          headers: { Authorization: `Bearer ${key}`, 'x-api-key': key },
-        });
-        const data = await res.json().catch(() => ({}));
-        const st = String(data.status || data.state || '').toLowerCase();
-        const videoUrl =
-          data.video_url || data.url || data.output?.url || data.result?.url ||
-          (Array.isArray(data.outputs) && data.outputs[0]?.url);
+        if (env.PIXAZO_API_KEY) {
+          return json(await pollLtxOnce(id, env));
+        }
 
-        if (videoUrl && (st.includes('success') || st.includes('complete') || st === 'done')) {
-          return json({ ok: true, status: 'COMPLETED', video_url: videoUrl, url: videoUrl, provider: 'ltx' });
-        }
-        if (st.includes('fail') || st.includes('error')) {
-          return json({ ok: false, status: 'FAILED', error: data.message || data.error || 'LTX failed' });
-        }
-        return json({ ok: true, status: 'PROCESSING', provider: 'ltx' });
+        return json({ ok: false, status: 'FAILED', error: 'Aucun provider poll' }, 500);
       }
 
-      // Sonaria / Illustro / Chat (inchangé)
-      if (action === 'sonaria' || action === 'audio' || body.sonaria_prompt || body.audio_prompt) {
-        const prompt = body.prompt || body.sonaria_prompt || body.audio_prompt || '';
+      /* ── Sonaria ── */
+      if (
+        action === 'sonaria' ||
+        action === 'audio' ||
+        body.sonaria_prompt ||
+        body.audio_prompt ||
+        body.ace_prompt
+      ) {
+        const prompt =
+          body.prompt || body.sonaria_prompt || body.audio_prompt || body.ace_prompt || '';
         const result = await runSonaria(prompt, body, env);
         return json(result, result.ok ? 200 : 502);
       }
 
-      if (action === 'illustro' || action === 'image' || body.illustro_prompt || body.image_prompt) {
-        const prompt = body.prompt || body.illustro_prompt || body.image_prompt || '';
+      /* ── Illustro ── */
+      if (
+        action === 'illustro' ||
+        action === 'image' ||
+        body.illustro_prompt ||
+        body.image_prompt
+      ) {
+        const prompt =
+          body.prompt || body.illustro_prompt || body.image_prompt || '';
         const result = await runIllustro(prompt, body, env);
         return json(result, result.ok ? 200 : 502);
       }
 
-      if (action === 'chat' || action === 'groq' || body.messages) {
+      /* ── Chat Groq ── */
+      if (action === 'chat' || action === 'groq' || Array.isArray(body.messages)) {
         const result = await runGroq(body.messages, env);
         return json(result, result.ok ? 200 : 502);
       }
 
-      return json({ error: 'Unknown action', action, keys: Object.keys(body || {}) }, 400);
+      return json(
+        {
+          error: 'Unknown action',
+          action,
+          keys: Object.keys(body || {}),
+        },
+        400
+      );
     } catch (e) {
       return json({ ok: false, error: e.message || String(e) }, 500);
     }
+  },
+};

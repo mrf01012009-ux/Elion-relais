@@ -42,9 +42,11 @@ async function proxyGemini(body, env) {
     body.model,
     'gemini-2.0-flash',
     'gemini-2.0-flash-001',
+    'gemini-2.0-flash-lite',
+    'gemini-2.5-flash',
     'gemini-1.5-flash',
+    'gemini-1.5-flash-002',
     'gemini-1.5-flash-latest',
-    'gemini-1.5-flash-8b',
   ].filter(Boolean);
 
   const payload = { contents: body.contents || [] };
@@ -77,6 +79,52 @@ async function proxyGemini(body, env) {
       lastErr = e.message || String(e);
     }
   }
+  // Secours Groq si Gemini KO
+  if (env.GROQ_API_KEY && Array.isArray(body.contents)) {
+    try {
+      const messages = [];
+      if (body.system_instruction && body.system_instruction.parts) {
+        const st = (body.system_instruction.parts || []).map((p) => p.text || '').join('\n');
+        if (st) messages.push({ role: 'system', content: st.slice(0, 8000) });
+      }
+      for (const c of body.contents) {
+        const role = c.role === 'model' ? 'assistant' : 'user';
+        const text = (c.parts || []).map((p) => p.text || '').filter(Boolean).join('\n');
+        if (text) messages.push({ role, content: text.slice(0, 12000) });
+      }
+      if (messages.length) {
+        const gRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            Authorization: 'Bearer ' + env.GROQ_API_KEY,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: 'llama-3.3-70b-versatile',
+            messages,
+            temperature: 0.7,
+          }),
+        });
+        const gData = await gRes.json().catch(() => ({}));
+        if (gRes.ok && gData.choices && gData.choices[0]) {
+          const reply = gData.choices[0].message?.content || '';
+          return json({
+            candidates: [
+              {
+                content: { parts: [{ text: reply }], role: 'model' },
+                finishReason: 'STOP',
+              },
+            ],
+            elion_provider: 'groq-fallback',
+          });
+        }
+        lastErr = (gData.error && gData.error.message) || lastErr;
+      }
+    } catch (eG) {
+      lastErr = eG.message || lastErr;
+    }
+  }
+
   return json({ error: { message: lastErr } }, lastStatus || 502);
 }
 
@@ -104,6 +152,7 @@ async function submitFluxionWorkersAI(prompt, opts, env) {
         duration,
         generate_audio: opts?.sound !== false,
       };
+      // img2vid si image fournie
       if (opts?.image_url || opts?.image) {
         input.mode = 'i2v';
         if (opts.image_url) input.image = opts.image_url;
@@ -129,6 +178,7 @@ async function submitFluxionWorkersAI(prompt, opts, env) {
         };
       }
 
+      // parfois state async
       if (r?.state && /complet|success|done/i.test(String(r.state))) {
         const u = r?.result?.video || r?.result?.url;
         if (u) {
@@ -203,7 +253,7 @@ async function pollAgnesOnce(videoId, env) {
   const key = env.AGNES_API_KEY;
   if (!key) return { ok: false, status: 'FAILED', error: 'AGNES_API_KEY manquante' };
   const url =
-    `\( {AGNES_BASE}/agnesapi?video_id= \){encodeURIComponent(videoId)}` +
+    `${AGNES_BASE}/agnesapi?video_id=${encodeURIComponent(videoId)}` +
     `&model_name=${encodeURIComponent(AGNES_MODEL)}`;
   const res = await fetch(url, { headers: { Authorization: `Bearer ${key}` } });
   const data = await res.json().catch(() => ({}));
@@ -370,6 +420,7 @@ export default {
         has_ai_binding: !!env.AI,
         has_agnes: !!env.AGNES_API_KEY,
         has_gemini: !!pickGeminiKey(env),
+        has_groq: !!env.GROQ_API_KEY,
       });
     }
 

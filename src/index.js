@@ -40,13 +40,13 @@ async function proxyGemini(body, env) {
 
   const models = [
     body.model,
+    'gemini-3.8-flash',
+    'gemini-3.7-flash',
     'gemini-2.5-flash',
     'gemini-flash-latest',
     'gemini-2.5-flash-lite',
-    'gemini-2.0-flash',
-    'gemini-2.0-flash-001',
-    'gemini-pro-latest',
     'gemini-2.5-pro',
+    'gemini-pro-latest',
   ].filter(Boolean);
 
   const payload = { contents: body.contents || [] };
@@ -421,7 +421,7 @@ export default {
         }
         const keyLen = key.length;
         const keyPrefix = key.slice(0, 6);
-        const modelsTry = ['gemini-2.5-flash', 'gemini-flash-latest', 'gemini-2.0-flash'];
+        const modelsTry = ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-flash-latest'];
         let lastErr = '';
         for (const model of modelsTry) {
           try {

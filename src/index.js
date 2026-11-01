@@ -347,30 +347,47 @@ async function pollLtxOnce(requestId, env) {
 
 /* ─── Sonaria / Illustro ─── */
 async function runSonaria(prompt, opts, env) {
-  const key = env.ACE_MUSIC_API_KEY || env.PIXAZO_API_KEY;
+  const key = env.ACE_MUSIC_API_KEY;
   if (!key) return { ok: false, error: 'ACE_MUSIC_API_KEY manquante' };
+  const text = String(prompt || '').slice(0, 1500);
   const duration = Math.min(35, Math.max(5, Number(opts?.duration || opts?.ace_duration) || 15));
-  const res = await fetch(ACE_CHAT_URL, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'ace-music',
-      messages: [{ role: 'user', content: String(prompt || '').slice(0, 1500) }],
-      task_type: 'text2music',
-      audio_config: { duration, instrumental: true, format: 'mp3' },
-    }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    return { ok: false, error: data.error?.message || data.message || `Ace HTTP ${res.status}` };
+  const body = {
+    model: 'ace-music',
+    messages: [{ role: 'user', content: text }],
+    task_type: 'text2music',
+    audio_config: { duration, instrumental: true, format: 'mp3' },
+  };
+  let lastErr = 'Ace indisponible';
+  // 2 tentatives (525 / timeout souvent temporaire)
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch(ACE_CHAT_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${key}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        const audioUrl =
+          data.choices?.[0]?.message?.audio?.[0]?.audio_url?.url ||
+          data.choices?.[0]?.message?.audio_url ||
+          data.audio_url ||
+          data.url;
+        if (audioUrl) return { ok: true, url: audioUrl, provider: 'ace-music' };
+        lastErr = 'Ace sans audio';
+        break;
+      }
+      lastErr = data.error?.message || data.message || `Ace HTTP ${res.status}`;
+      // 525 / 502 / 503 → une 2e chance
+      if (![502, 503, 525, 504].includes(res.status)) break;
+    } catch (e) {
+      lastErr = 'Ace: ' + (e.message || String(e));
+    }
   }
-  const audioUrl =
-    data.choices?.[0]?.message?.audio?.[0]?.audio_url?.url ||
-    data.choices?.[0]?.message?.audio_url ||
-    data.audio_url ||
-    data.url;
-  if (!audioUrl) return { ok: false, error: 'Ace sans audio', raw: data };
-  return { ok: true, url: audioUrl, provider: 'ace-music' };
+  return { ok: false, error: lastErr };
 }
 
 async function runIllustro(prompt, opts, env) {
@@ -381,22 +398,42 @@ async function runIllustro(prompt, opts, env) {
   const models = [
     '@cf/black-forest-labs/flux-2-klein-4b',
     '@cf/black-forest-labs/flux-2-dev',
+    '@cf/black-forest-labs/flux-1-schnell',
   ];
   let lastErr = 'Illustro failed';
-  for (let i = 0; i < models.length; i++) {
+
+  async function tryRun(model, input) {
+    const r = await env.AI.run(model, input);
+    const b64 = r?.image || r?.images?.[0] || (typeof r === 'string' ? r : null);
+    if (b64) return { ok: true, image: b64, provider: model };
+    return null;
+  }
+
+  for (const model of models) {
+    // 1) multipart (exigé par Flux 2)
     try {
-      let r;
-      if (i === 0) {
-        const form = new FormData();
-        form.append('prompt', p);
-        form.append('width', String(width));
-        form.append('height', String(height));
-        r = await env.AI.run(models[i], form);
-      } else {
-        r = await env.AI.run(models[i], { prompt: p, width, height });
-      }
-      const b64 = r?.image || r?.images?.[0];
-      if (b64) return { ok: true, image: b64, provider: models[i] };
+      const form = new FormData();
+      form.append('prompt', p);
+      form.append('width', String(width));
+      form.append('height', String(height));
+      const hit = await tryRun(model, form);
+      if (hit) return hit;
+    } catch (e) {
+      lastErr = e.message || String(e);
+    }
+    // 2) multipart prompt seul
+    try {
+      const form2 = new FormData();
+      form2.append('prompt', p);
+      const hit2 = await tryRun(model, form2);
+      if (hit2) return hit2;
+    } catch (e) {
+      lastErr = e.message || String(e);
+    }
+    // 3) JSON (flux-1-schnell / anciens)
+    try {
+      const hit3 = await tryRun(model, { prompt: p, width, height });
+      if (hit3) return hit3;
     } catch (e) {
       lastErr = e.message || String(e);
     }
@@ -480,7 +517,7 @@ export default {
         fluxion_primary: env.AI ? 'workers-ai-flux3-video' : 'off',
         fluxion_fallback: env.AGNES_API_KEY ? 'agnes-flash' : 'off',
         fluxion_fallback2: env.PIXAZO_API_KEY ? 'ltx' : 'off',
-        sonaria: env.ACE_MUSIC_API_KEY || env.PIXAZO_API_KEY ? 'ace' : 'off',
+        sonaria: env.ACE_MUSIC_API_KEY ? 'ace' : 'off',
         illustro: env.AI ? 'flux-2' : 'off',
         has_ai_binding: !!env.AI,
         has_agnes: !!env.AGNES_API_KEY,
@@ -558,7 +595,7 @@ export default {
           {
             ok: false,
             error: cf.error || agnes.error || ltx.error || 'Fluxion indisponible',
-          },
+        },
           502
         );
       }

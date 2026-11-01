@@ -347,110 +347,62 @@ async function pollLtxOnce(requestId, env) {
 
 /* ─── Sonaria / Illustro ─── */
 async function runSonaria(prompt, opts, env) {
+  const key = env.ACE_MUSIC_API_KEY;
+  if (!key) {
+    return {
+      ok: false,
+      error: 'Sonaria indisponible pour le moment.',
+      code: 'sonaria_unavailable',
+    };
+  }
   const text = String(prompt || '').slice(0, 1500);
   const duration = Math.min(35, Math.max(5, Number(opts?.duration || opts?.ace_duration) || 15));
-  const errors = [];
-
-  // 1) Ace Music
-  if (env.ACE_MUSIC_API_KEY) {
-    const body = {
-      model: 'ace-music',
-      messages: [{ role: 'user', content: text }],
-      task_type: 'text2music',
-      audio_config: { duration, instrumental: true, format: 'mp3' },
-    };
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const res = await fetch(ACE_CHAT_URL, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${env.ACE_MUSIC_API_KEY}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(body),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (res.ok) {
-          const audioUrl =
-            data.choices?.[0]?.message?.audio?.[0]?.audio_url?.url ||
-            data.choices?.[0]?.message?.audio_url ||
-            data.audio_url ||
-            data.url;
-          if (audioUrl) return { ok: true, url: audioUrl, provider: 'ace-music' };
-          errors.push('Ace sans audio');
-          break;
-        }
-        errors.push(data.error?.message || data.message || `Ace HTTP ${res.status}`);
-        if (![502, 503, 525, 504].includes(res.status)) break;
-      } catch (e) {
-        errors.push('Ace: ' + (e.message || String(e)));
-      }
-    }
-  } else {
-    errors.push('ACE_MUSIC_API_KEY absente');
-  }
-
-  // 2) Fallback Lyria 3 Clip (Gemini API — même clé)
-  const gKey = pickGeminiKey(env);
-  if (gKey) {
-    const lyriaPrompt =
-      text +
-      (/\binstrumental\b|\bno vocals?\b|\binstrumental only\b/i.test(text)
-        ? ''
-        : '. Instrumental only, no vocals.');
+  const body = {
+    model: 'ace-music',
+    messages: [{ role: 'user', content: text }],
+    task_type: 'text2music',
+    audio_config: { duration, instrumental: true, format: 'mp3' },
+  };
+  let lastStatus = 0;
+  let lastErr = 'Ace indisponible';
+  for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const res = await fetch(
-        'https://generativelanguage.googleapis.com/v1beta/models/lyria-3-clip-preview:generateContent?key=' +
-          encodeURIComponent(gKey),
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ role: 'user', parts: [{ text: lyriaPrompt.slice(0, 1500) }] }],
-          }),
-        }
-      );
+      const res = await fetch(ACE_CHAT_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${key}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+      lastStatus = res.status;
       const data = await res.json().catch(() => ({}));
       if (res.ok) {
-        // Audio in parts as inlineData
-        const parts =
-          data?.candidates?.[0]?.content?.parts ||
-          data?.candidates?.[0]?.content?.parts ||
-          [];
-        let b64 = null;
-        let mime = 'audio/mp3';
-        for (const part of parts) {
-          const id = part.inlineData || part.inline_data;
-          if (id && (id.data || id.Data)) {
-            b64 = id.data || id.Data;
-            mime = id.mimeType || id.mime_type || 'audio/mp3';
-            break;
-          }
-        }
-        if (b64) {
-          return {
-            ok: true,
-            url: 'data:' + mime + ';base64,' + b64,
-            provider: 'lyria-3-clip',
-          };
-        }
-        errors.push('Lyria sans audio');
-      } else {
-        errors.push(
-          data?.error?.message || data?.message || `Lyria HTTP ${res.status}`
-        );
+        const audioUrl =
+          data.choices?.[0]?.message?.audio?.[0]?.audio_url?.url ||
+          data.choices?.[0]?.message?.audio_url ||
+          data.audio_url ||
+          data.url;
+        if (audioUrl) return { ok: true, url: audioUrl, provider: 'ace-music' };
+        lastErr = 'Ace sans audio';
+        break;
       }
+      lastErr = data.error?.message || data.message || `Ace HTTP ${res.status}`;
+      if (![502, 503, 525, 504].includes(res.status)) break;
     } catch (e) {
-      errors.push('Lyria: ' + (e.message || String(e)));
+      lastErr = e.message || String(e);
     }
-  } else {
-    errors.push('GEMINI_API_KEY absente (Lyria)');
   }
-
-  return {
-    ok: false,
-    error: errors.filter(Boolean).slice(0, 4).join(' → ') || 'Sonaria indisponible',
-  };
+  // 525 / SSL / server down → message propre
+  if ([525, 502, 503, 504].includes(lastStatus) || /525|ssl|certificate/i.test(String(lastErr))) {
+    return {
+      ok: false,
+      error: 'Sonaria indisponible pour le moment.',
+      code: 'sonaria_unavailable',
+      detail: lastErr,
+    };
+  }
+  return { ok: false, error: lastErr, code: 'sonaria_error' };
 }
 
 async function runIllustro(prompt, opts, env) {
@@ -571,7 +523,7 @@ export default {
         fluxion_primary: env.AI ? 'workers-ai-flux3-video' : 'off',
         fluxion_fallback: env.AGNES_API_KEY ? 'agnes-flash' : 'off',
         fluxion_fallback2: env.PIXAZO_API_KEY ? 'ltx' : 'off',
-        sonaria: env.ACE_MUSIC_API_KEY || pickGeminiKey(env) ? 'ace→lyria' : 'off',
+        sonaria: env.ACE_MUSIC_API_KEY ? 'ace' : 'off',
         illustro: env.AI ? 'flux-2' : 'off',
         has_ai_binding: !!env.AI,
         has_agnes: !!env.AGNES_API_KEY,
@@ -648,7 +600,7 @@ export default {
         return json(
           {
             ok: false,
-            error: cf.error || agnes.error || ltx.error || 'Fluxion indisponible',
+            error: cf.error || agnees.error || ltx.error || 'Fluxion indisponible',
           },
           502
         );

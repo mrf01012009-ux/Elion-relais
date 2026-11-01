@@ -393,8 +393,6 @@ async function runSonaria(prompt, opts, env) {
 async function runIllustro(prompt, opts, env) {
   if (!env.AI) return { ok: false, error: 'Workers AI non lié' };
   const p = String(prompt || '').slice(0, 2000);
-  const width = Number(opts?.width) || 1024;
-  const height = Number(opts?.height) || 1024;
   const models = [
     '@cf/black-forest-labs/flux-2-klein-4b',
     '@cf/black-forest-labs/flux-2-dev',
@@ -402,44 +400,37 @@ async function runIllustro(prompt, opts, env) {
   ];
   let lastErr = 'Illustro failed';
 
-  async function tryRun(model, input) {
-    const r = await env.AI.run(model, input);
-    const b64 = r?.image || r?.images?.[0] || (typeof r === 'string' ? r : null);
-    if (b64) return { ok: true, image: b64, provider: model };
-    return null;
-  }
-
   for (const model of models) {
-    // 1) multipart (exigé par Flux 2)
+    // Flux 2 = multipart avec prompt UNIQUEMENT (width/height interdits)
     try {
       const form = new FormData();
       form.append('prompt', p);
-      form.append('width', String(width));
-      form.append('height', String(height));
-      const hit = await tryRun(model, form);
-      if (hit) return hit;
+      const r = await env.AI.run(model, form);
+      const b64 =
+        r?.image ||
+        r?.images?.[0] ||
+        (typeof r === 'string' ? r : null) ||
+        r?.result?.image;
+      if (b64) return { ok: true, image: b64, provider: model };
+      lastErr = 'Réponse sans image (' + model + ')';
     } catch (e) {
       lastErr = e.message || String(e);
     }
-    // 2) multipart prompt seul
+    // Secours JSON (flux-1-schnell)
     try {
-      const form2 = new FormData();
-      form2.append('prompt', p);
-      const hit2 = await tryRun(model, form2);
-      if (hit2) return hit2;
-    } catch (e) {
-      lastErr = e.message || String(e);
-    }
-    // 3) JSON (flux-1-schnell / anciens)
-    try {
-      const hit3 = await tryRun(model, { prompt: p, width, height });
-      if (hit3) return hit3;
-    } catch (e) {
-      lastErr = e.message || String(e);
+      const r2 = await env.AI.run(model, { prompt: p });
+      const b642 =
+        r2?.image ||
+        r2?.images?.[0] ||
+        (typeof r2 === 'string' ? r2 : null);
+      if (b642) return { ok: true, image: b642, provider: model };
+    } catch (e2) {
+      lastErr = e2.message || String(e2);
     }
   }
   return { ok: false, error: lastErr };
 }
+
 
 export default {
   async fetch(request, env) {
@@ -595,7 +586,7 @@ export default {
           {
             ok: false,
             error: cf.error || agnes.error || ltx.error || 'Fluxion indisponible',
-        },
+          },
           502
         );
       }
@@ -608,7 +599,7 @@ export default {
         if (id.startsWith('cf-done-')) {
           return json({
             ok: false,
-            status: 'FAILED',
+  status: 'FAILED',
             error: 'Job CF déjà terminé côté submit — rafraîchis',
           });
         }

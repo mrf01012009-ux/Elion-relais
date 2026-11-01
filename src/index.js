@@ -40,13 +40,13 @@ async function proxyGemini(body, env) {
 
   const models = [
     body.model,
+    'gemini-2.5-flash',
+    'gemini-flash-latest',
+    'gemini-2.5-flash-lite',
     'gemini-2.0-flash',
     'gemini-2.0-flash-001',
-    'gemini-2.0-flash-lite',
-    'gemini-2.5-flash',
-    'gemini-1.5-flash',
-    'gemini-1.5-flash-002',
-    'gemini-1.5-flash-latest',
+    'gemini-pro-latest',
+    'gemini-2.5-pro',
   ].filter(Boolean);
 
   const payload = { contents: body.contents || [] };
@@ -75,6 +75,10 @@ async function proxyGemini(body, env) {
       lastStatus = res.status;
       lastErr = data?.error?.message || data?.message || `Gemini HTTP ${res.status}`;
       if (res.status === 429) return json(data, 429);
+      // Clé invalide → inutile d'essayer d'autres modèles Gemini
+      if (/API key not valid|INVALID_ARGUMENT|invalid api key/i.test(String(lastErr))) {
+        break;
+      }
     } catch (e) {
       lastErr = e.message || String(e);
     }
@@ -408,6 +412,67 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === 'GET') {
+      const url = new URL(request.url);
+      // GET /?ping=gemini → teste vraiment la clé (sans l'exposer)
+      if (url.searchParams.get('ping') === 'gemini') {
+        const key = pickGeminiKey(env);
+        if (!key) {
+          return json({ ok: false, ping: 'gemini', error: 'GEMINI_API_KEY absente' }, 500);
+        }
+        const keyLen = key.length;
+        const keyPrefix = key.slice(0, 6);
+        const modelsTry = ['gemini-2.5-flash', 'gemini-flash-latest', 'gemini-2.0-flash'];
+        let lastErr = '';
+        for (const model of modelsTry) {
+          try {
+            const r = await fetch(
+              'https://generativelanguage.googleapis.com/v1beta/models/' +
+                encodeURIComponent(model) +
+                ':generateContent?key=' +
+                encodeURIComponent(key),
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  contents: [{ role: 'user', parts: [{ text: 'ping' }] }],
+                }),
+              }
+            );
+            const data = await r.json().catch(() => ({}));
+            if (r.ok) {
+              return json({
+                ok: true,
+                ping: 'gemini',
+                model,
+                key_len: keyLen,
+                key_prefix: keyPrefix,
+                status: r.status,
+              });
+            }
+            lastErr = data?.error?.message || data?.message || ('HTTP ' + r.status);
+            if (/API key not valid/i.test(String(lastErr))) {
+              return json({
+                ok: false,
+                ping: 'gemini',
+                error: lastErr,
+                key_len: keyLen,
+                key_prefix: keyPrefix,
+                hint: 'La clé dans Cloudflare est différente ou invalide (même si elle marche dans le navigateur). Recolle-la + Deploy.',
+              }, 502);
+            }
+          } catch (e) {
+            lastErr = e.message || String(e);
+          }
+        }
+        return json({
+          ok: false,
+          ping: 'gemini',
+          error: lastErr,
+          key_len: keyLen,
+          key_prefix: keyPrefix,
+        }, 502);
+      }
+
       return json({
         ok: true,
         service: 'elion-relay',
@@ -421,6 +486,7 @@ export default {
         has_agnes: !!env.AGNES_API_KEY,
         has_gemini: !!pickGeminiKey(env),
         has_groq: !!env.GROQ_API_KEY,
+        tip: 'Teste la clé: GET /?ping=gemini',
       });
     }
 

@@ -33,20 +33,137 @@ function pickGeminiKey(env) {
   return env.GEMINI_API_KEY || env.GEMINI_API_KEY_2 || env.GEMINI_API_KEY_3 || '';
 }
 
+
+/** Gemini contents → messages Workers AI */
+function geminiToMessages(body) {
+  const messages = [];
+  let sys = '';
+  if (body.system_instruction) {
+    if (typeof body.system_instruction === 'string') sys = body.system_instruction;
+    else if (body.system_instruction.parts) {
+      sys = (body.system_instruction.parts || []).map((p) => p.text || '').filter(Boolean).join('\n');
+    }
+  }
+  if (sys) messages.push({ role: 'system', content: String(sys).slice(0, 8000) });
+
+  const contents = Array.isArray(body.contents) ? body.contents : [];
+  for (const c of contents) {
+    const role = c.role === 'model' ? 'assistant' : 'user';
+    const texts = [];
+    for (const part of c.parts || []) {
+      if (part.text) texts.push(part.text);
+    }
+    const content = texts.join('\n').trim();
+    if (content) messages.push({ role, content: content.slice(0, 12000) });
+  }
+  if (!messages.some((m) => m.role === 'user')) {
+    messages.push({ role: 'user', content: String(body.prompt || 'Bonjour') });
+  }
+  return messages;
+}
+
+async function chatWorkersAI(body, env, modelList) {
+  if (!env.AI) return null;
+  const messages = geminiToMessages(body);
+  const models = modelList || [
+    '@cf/meta/llama-3.1-8b-instruct-fast',
+    '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+  ];
+  for (const model of models) {
+    try {
+      const r = await env.AI.run(model, {
+        messages,
+        max_tokens: 2048,
+        temperature: 0.7,
+      });
+      const text =
+        (typeof r === 'string' ? r : null) ||
+        r?.response ||
+        r?.result?.response ||
+        r?.output_text ||
+        null;
+      if (text && String(text).trim()) {
+        return {
+          candidates: [{ content: { role: 'model', parts: [{ text: String(text).trim() }] } }],
+          provider: 'workers-ai',
+          model,
+        };
+      }
+    } catch (e) {
+      /* try next */
+    }
+  }
+  return null;
+}
+
+
+
 /* ─── Chat Gemini ─── */
 async function proxyGemini(body, env) {
+  // Vision / images → Gemini uniquement
+  const hasImage = !!(
+    body.has_image ||
+    body.force_vision ||
+    (Array.isArray(body.contents) &&
+      body.contents.some(
+        (c) =>
+          Array.isArray(c.parts) &&
+          c.parts.some((p) => p.inline_data || p.inlineData || p.file_data)
+      ))
+  );
+
+  /*
+   * Routing modes Elion :
+   *  smart     → Llama 3.3 70B (Workers AI)
+   *  search    → Gemini
+   *  think     → DeepSeek (Workers AI) → Gemini
+   *  architect → DeepSeek (Workers AI) → Gemini
+   *  writer    → Gemini
+   *  vision    → Gemini
+   */
+  const mode = String(body.elion_mode || body.mode || 'smart').toLowerCase();
+
+  if (hasImage || body.force_vision) {
+    // vision → Gemini only below
+  } else if (mode === 'smart' || mode === 'mellowcore' || !mode) {
+    if (env.AI && !body.force_gemini) {
+      const w = await chatWorkersAI(body, env, [
+        '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+        '@cf/meta/llama-3.1-8b-instruct-fast',
+      ]);
+      if (w && w.candidates) return json(w);
+    }
+  } else if (mode === 'think' || mode === 'architect') {
+    if (env.AI && !body.force_gemini) {
+      const w = await chatWorkersAI(body, env, [
+        '@cf/deepseek-ai/deepseek-v4-flash-0731',
+        '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b',
+        '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+      ]);
+      if (w && w.candidates) return json(w);
+    }
+  }
+  // search + writer + fallbacks → Gemini
+
   const key = pickGeminiKey(env);
-  if (!key) return json({ error: { message: 'GEMINI_API_KEY manquante' } }, 500);
+  if (!key) {
+    // dernier recours Workers AI
+    if (env.AI) {
+      const w = await chatWorkersAI(body, env, [
+        '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+        '@cf/meta/llama-3.1-8b-instruct-fast',
+      ]);
+      if (w && w.candidates) return json(w);
+    }
+    return json({ error: { message: 'GEMINI_API_KEY manquante' } }, 500);
+  }
 
   const models = [
     body.model,
-    'gemini-3.8-flash',
-    'gemini-3.7-flash',
-    'gemini-2.5-flash',
     'gemini-flash-latest',
+    'gemini-2.5-flash',
     'gemini-2.5-flash-lite',
-    'gemini-2.5-pro',
-    'gemini-pro-latest',
+    'gemini-3.8-flash',
   ].filter(Boolean);
 
   const payload = { contents: body.contents || [] };
@@ -464,7 +581,7 @@ export default {
         }
         const keyLen = key.length;
         const keyPrefix = key.slice(0, 6);
-        const modelsTry = ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-flash-latest'];
+        const modelsTry = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-3.8-flash'];
         let lastErr = '';
         for (const model of modelsTry) {
           try {
@@ -489,7 +606,7 @@ export default {
                 model,
                 key_len: keyLen,
                 key_prefix: keyPrefix,
-                status: r.status,
+             status: r.status,
               });
             }
             lastErr = data?.error?.message || data?.message || ('HTTP ' + r.status);
@@ -519,7 +636,7 @@ export default {
       return json({
         ok: true,
         service: 'elion-relay',
-        chat: pickGeminiKey(env) ? 'gemini' : 'off',
+        chat: env.AI ? 'workers-ai→gemini' : (pickGeminiKey(env) ? 'gemini' : 'off'),
         fluxion_primary: env.AI ? 'workers-ai-flux3-video' : 'off',
         fluxion_fallback: env.AGNES_API_KEY ? 'agnes-flash' : 'off',
         fluxion_fallback2: env.PIXAZO_API_KEY ? 'ltx' : 'off',
@@ -600,7 +717,7 @@ export default {
         return json(
           {
             ok: false,
-            error: cf.error || agnees.error || ltx.error || 'Fluxion indisponible',
+            error: cf.error || agnes.error || ltx.error || 'Fluxion indisponible',
           },
           502
         );

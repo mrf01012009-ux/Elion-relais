@@ -137,6 +137,47 @@ async function chatGroq(body, env) {
   }
 }
 
+
+/** Stream Workers AI → SSE text/event-stream (réflexion en direct) */
+async function streamChatWorkersAI(body, env) {
+  if (!env.AI) return null;
+  const messages = geminiToMessages(body);
+  // Force le modèle à raisonner sur la question
+  messages.unshift({
+    role: 'system',
+    content:
+      'Tu es ElionAI en mode réflexion. Commence TOUJOURS par un raisonnement détaillé et utile sur la question de l\'utilisateur (faits, hypothèses, étapes), puis donne la réponse finale. Écris le raisonnement en français, concret, lié à la question posée — pas de phrases génériques.',
+  });
+  const models = [
+    '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+    '@cf/meta/llama-3.1-8b-instruct-fast',
+  ];
+  for (const model of models) {
+    try {
+      const stream = await env.AI.run(model, {
+        messages,
+        max_tokens: 2048,
+        temperature: 0.6,
+        stream: true,
+      });
+      if (stream) {
+        return new Response(stream, {
+          headers: {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-cache',
+            'X-Elion-Model': model,
+            'X-Elion-Provider': 'workers-ai-stream',
+            ...CORS,
+          },
+        });
+      }
+    } catch (e) {
+      /* try next */
+    }
+  }
+  return null;
+}
+
 async function proxyGemini(body, env) {
   // Vision / images → Gemini uniquement
   const hasImage = !!(
@@ -160,6 +201,17 @@ async function proxyGemini(body, env) {
    *  vision    → Gemini
    */
   const mode = String(body.elion_mode || body.mode || 'smart').toLowerCase();
+
+  // Stream live pour Think / Architect
+  if (
+    body.stream &&
+    !hasImage &&
+    env.AI &&
+    (mode === 'think' || mode === 'architect')
+  ) {
+    const streamed = await streamChatWorkersAI(body, env);
+    if (streamed) return streamed;
+  }
 
   if (hasImage || body.force_vision) {
     // vision → Gemini only below
@@ -565,7 +617,7 @@ async function runSonaria(prompt, opts, env) {
     }
   }
   // 525 / SSL / server down → message propre
-  if ([525, 502, 503, 504].includes(lastStatus) || /525|ssl|certificate/i.test(String(lastErr))) {
+  if ([525, 502, 503, 504.includes(lastStatus) || /525|ssl|certificate/i.test(String(lastErr))) {
     return {
       ok: false,
       error: 'Sonaria indisponible pour le moment.',
@@ -612,7 +664,7 @@ async function runIllustro(prompt, opts, env) {
       if (b642) return { ok: true, image: b642, provider: model };
     } catch (e2) {
       lastErr = e2.message || String(e2);
-}
+    }
   }
   return { ok: false, error: lastErr };
 }
@@ -776,8 +828,7 @@ export default {
           502
         );
       }
-
-      /* Fluxion POLL */
+/* Fluxion POLL */
       if (body.ltx_status) {
         const id = String(body.ltx_status);
         const provider = String(body.provider || '');

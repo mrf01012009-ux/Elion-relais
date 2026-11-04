@@ -20,7 +20,7 @@ const LTX_SUBMIT = [
   'https://gateway.pixazo.ai/ltx-video/v1/text-to-video',
 ];
 const LTX_STATUS = 'https://gateway.pixazo.ai/v2/requests/status/';
-const ACE_CHAT_URL = 'https://api.ace-music.com/v1/chat/completions';
+const ACE_CHAT_URL = 'https://api.acemusic.ai/v1/chat/completions';
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {

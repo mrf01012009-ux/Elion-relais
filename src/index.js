@@ -73,16 +73,23 @@ async function chatWorkersAI(body, env, modelList) {
     try {
       const r = await env.AI.run(model, {
         messages,
-        max_tokens: 2048,
+        max_tokens: 1024,
         temperature: 0.7,
       });
-      const text =
+      let text =
         (typeof r === 'string' ? r : null) ||
         r?.response ||
         r?.result?.response ||
         r?.output_text ||
+        r?.text ||
         null;
-      if (text && String(text).trim()) {
+      if (!text && r && typeof r === 'object') {
+        try {
+          text = JSON.stringify(r).slice(0, 50); // debug
+          if (!r.response && !r.result) text = null;
+        } catch (e) {}
+      }
+      if (text && String(text).trim() && String(text).length > 1) {
         return {
           candidates: [{ content: { role: 'model', parts: [{ text: String(text).trim() }] } }],
           provider: 'workers-ai',
@@ -90,7 +97,7 @@ async function chatWorkersAI(body, env, modelList) {
         };
       }
     } catch (e) {
-      /* try next */
+      /* next model */
     }
   }
   return null;
@@ -99,6 +106,37 @@ async function chatWorkersAI(body, env, modelList) {
 
 
 /* ─── Chat Gemini ─── */
+
+async function chatGroq(body, env) {
+  if (!env.GROQ_API_KEY) return null;
+  try {
+    const messages = geminiToMessages(body);
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + env.GROQ_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages,
+        max_tokens: 1024,
+        temperature: 0.7,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    const text = data?.choices?.[0]?.message?.content;
+    if (!res.ok || !text) return null;
+    return {
+      candidates: [{ content: { role: 'model', parts: [{ text: String(text).trim() }] } }],
+      provider: 'groq',
+      model: 'llama-3.3-70b-versatile',
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
 async function proxyGemini(body, env) {
   // Vision / images → Gemini uniquement
   const hasImage = !!(
@@ -126,36 +164,52 @@ async function proxyGemini(body, env) {
   if (hasImage || body.force_vision) {
     // vision → Gemini only below
   } else if (mode === 'smart' || mode === 'mellowcore' || !mode) {
+    // Smart → Llama 3.3 70B (puis 8B fast si besoin)
     if (env.AI && !body.force_gemini) {
       const w = await chatWorkersAI(body, env, [
         '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
         '@cf/meta/llama-3.1-8b-instruct-fast',
+        '@cf/meta/llama-3.1-8b-instruct-fp8',
+        '@cf/meta/llama-3.2-3b-instruct',
       ]);
       if (w && w.candidates) return json(w);
+    }
+    // Groq secours si Workers AI KO
+    if (env.GROQ_API_KEY) {
+      const gr = await chatGroq(body, env);
+      if (gr) return json(gr);
     }
   } else if (mode === 'think' || mode === 'architect') {
     if (env.AI && !body.force_gemini) {
       const w = await chatWorkersAI(body, env, [
         '@cf/deepseek-ai/deepseek-v4-flash-0731',
-        '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b',
-        '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-      ]);
-      if (w && w.candidates) return json(w);
-    }
-  }
-  // search + writer + fallbacks → Gemini
-
-  const key = pickGeminiKey(env);
-  if (!key) {
-    // dernier recours Workers AI
-    if (env.AI) {
-      const w = await chatWorkersAI(body, env, [
+        '@cf/qwen/qwen3.8-27b',
         '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
         '@cf/meta/llama-3.1-8b-instruct-fast',
       ]);
       if (w && w.candidates) return json(w);
     }
-    return json({ error: { message: 'GEMINI_API_KEY manquante' } }, 500);
+    if (env.GROQ_API_KEY) {
+      const gr = await chatGroq(body, env);
+      if (gr) return json(gr);
+    }
+  }
+  // search + writer → Gemini ; sinon fallbacks
+
+  const key = pickGeminiKey(env);
+  if (!key) {
+    if (env.AI) {
+      const w = await chatWorkersAI(body, env, [
+        '@cf/meta/llama-3.1-8b-instruct-fast',
+        '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+      ]);
+      if (w && w.candidates) return json(w);
+    }
+    if (env.GROQ_API_KEY) {
+      const gr = await chatGroq(body, env);
+      if (gr) return json(gr);
+    }
+    return json({ error: { message: 'Aucun modèle disponible (Workers AI / Gemini / Groq)' } }, 500);
   }
 
   const models = [
@@ -558,7 +612,7 @@ async function runIllustro(prompt, opts, env) {
       if (b642) return { ok: true, image: b642, provider: model };
     } catch (e2) {
       lastErr = e2.message || String(e2);
-    }
+}
   }
   return { ok: false, error: lastErr };
 }
@@ -606,7 +660,7 @@ export default {
                 model,
                 key_len: keyLen,
                 key_prefix: keyPrefix,
-             status: r.status,
+                status: r.status,
               });
             }
             lastErr = data?.error?.message || data?.message || ('HTTP ' + r.status);

@@ -581,8 +581,9 @@ async function runSonaria(prompt, opts, env) {
   const text = String(prompt || '').slice(0, 1500);
   const duration = Math.min(35, Math.max(5, Number(opts?.duration || opts?.ace_duration) || 15));
   const body = {
-    model: 'ace-music',
+    model: 'acemusic/acestep-v15-turbo',
     messages: [{ role: 'user', content: text }],
+    modalities: ['text', 'audio'],
     task_type: 'text2music',
     audio_config: { duration, instrumental: true, format: 'mp3' },
   };
@@ -616,8 +617,8 @@ async function runSonaria(prompt, opts, env) {
       lastErr = e.message || String(e);
     }
   }
-  // 525 / SSL / server down → message propre
-  if ([525, 502, 503, 504.includes(lastStatus) || /525|ssl|certificate/i.test(String(lastErr))) {
+  // 525 / SSL / serv
+if ([404, 525, 502, 503, 504].includes(lastStatus) || /525|ssl|certificate|404|not found/i.test(String(lastErr))) {
     return {
       ok: false,
       error: 'Sonaria indisponible pour le moment.',
@@ -827,8 +828,8 @@ export default {
           },
           502
         );
-      }
-/* Fluxion POLL */
+        }
+      /* Fluxion POLL */
       if (body.ltx_status) {
         const id = String(body.ltx_status);
         const provider = String(body.provider || '');
@@ -909,4 +910,4 @@ export default {
       return json({ error: { message: e.message || String(e) } }, 500);
     }
   },
-};
+}; je 

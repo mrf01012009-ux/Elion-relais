@@ -579,54 +579,100 @@ async function runSonaria(prompt, opts, env) {
     };
   }
   const text = String(prompt || '').slice(0, 1500);
-  const duration = Math.min(35, Math.max(5, Number(opts?.duration || opts?.ace_duration) || 15));
-  const body = {
-    model: 'acemusic/acestep-v15-turbo',
-    messages: [{ role: 'user', content: text }],
-    modalities: ['text', 'audio'],
-    task_type: 'text2music',
-    audio_config: { duration, instrumental: true, format: 'mp3' },
-  };
+  const duration = Math.min(120, Math.max(5, Number(opts?.duration || opts?.ace_duration) || 30));
+  // Nom officiel renvoyé par GET /v1/models (avec le point)
+  const models = [
+    'acemusic/acestep-v1.5-turbo',
+    'acemusic/acestep-v15-turbo',
+    'acestep-v15-turbo',
+  ];
   let lastStatus = 0;
   let lastErr = 'Ace indisponible';
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const res = await fetch(ACE_CHAT_URL, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${key}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-      });
-      lastStatus = res.status;
-      const data = await res.json().catch(() => ({}));
-      if (res.ok) {
-        const audioUrl =
-          data.choices?.[0]?.message?.audio?.[0]?.audio_url?.url ||
-          data.choices?.[0]?.message?.audio_url ||
-          data.audio_url ||
-          data.url;
-        if (audioUrl) return { ok: true, url: audioUrl, provider: 'ace-music' };
-        lastErr = 'Ace sans audio';
-        break;
+
+  function extractAudio(data) {
+    const msg = data?.choices?.[0]?.message;
+    if (!msg) return null;
+    const a = msg.audio;
+    if (Array.isArray(a) && a.length) {
+      const first = a[0];
+      return (
+        first?.audio_url?.url ||
+        first?.url ||
+        (typeof first === 'string' ? first : null)
+      );
+    }
+    if (a && typeof a === 'object') return a.audio_url?.url || a.url || null;
+    if (typeof msg.audio_url === 'string') return msg.audio_url;
+    if (msg.audio_url?.url) return msg.audio_url.url;
+    return data.audio_url || data.url || null;
+  }
+
+  for (const model of models) {
+    // 1) sample_mode simple (doc Ace)
+    // 2) audio_config + instrumental
+    const payloads = [
+      {
+        model,
+        messages: [{ role: 'user', content: text }],
+        stream: false,
+        sample_mode: true,
+        thinking: false,
+        audio_config: { duration, format: 'mp3', instrumental: true },
+      },
+      {
+        model,
+        messages: [{ role: 'user', content: text }],
+       stream: false,
+        audio_config: { duration, format: 'mp3', instrumental: true },
+      },
+    ];
+    for (const body of payloads) {
+      try {
+        const res = await fetch(ACE_CHAT_URL, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${key}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(body),
+        });
+        lastStatus = res.status;
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          const audioUrl = extractAudio(data);
+          if (audioUrl) {
+            return { ok: true, url: audioUrl, provider: 'ace-music', model };
+          }
+          lastErr = 'Ace sans audio dans la réponse';
+          continue;
+        }
+        lastErr =
+          data.error?.message ||
+          data.message ||
+          data.detail ||
+          `Ace HTTP ${res.status}`;
+        // 404 modèle → essayer le suivant
+        if (res.status === 404) continue;
+        if (![502, 503, 525, 504, 429].includes(res.status)) {
+          // autre erreur non retryable pour ce payload
+          break;
+        }
+      } catch (e) {
+        lastErr = e.message || String(e);
       }
-      lastErr = data.error?.message || data.message || `Ace HTTP ${res.status}`;
-      if (![502, 503, 525, 504].includes(res.status)) break;
-    } catch (e) {
-      lastErr = e.message || String(e);
     }
   }
-  // 525 / SSL / serv
-if ([404, 525, 502, 503, 504].includes(lastStatus) || /525|ssl|certificate|404|not found/i.test(String(lastErr))) {
+
+  if ([404, 525, 502, 503, 504].includes(lastStatus) || /525|ssl|certificate|404|not found/i.test(String(lastErr))) {
     return {
       ok: false,
       error: 'Sonaria indisponible pour le moment.',
       code: 'sonaria_unavailable',
       detail: lastErr,
+      status: lastStatus,
     };
   }
-  return { ok: false, error: lastErr, code: 'sonaria_error' };
+  return { ok: false, error: lastErr, code: 'sonaria_error', status: lastStatus };
 }
 
 async function runIllustro(prompt, opts, env) {
@@ -828,7 +874,8 @@ export default {
           },
           502
         );
-        }
+      }
+
       /* Fluxion POLL */
       if (body.ltx_status) {
         const id = String(body.ltx_status);
@@ -910,4 +957,5 @@ export default {
       return json({ error: { message: e.message || String(e) } }, 500);
     }
   },
-}; je 
+};
+                       

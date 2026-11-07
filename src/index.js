@@ -17,8 +17,43 @@ const ACE_CHAT_URL = 'https://api.acemusic.ai/v1/chat/completions';
 /* Fal — Seedance 2.0 + Wan 3 */
 const FAL_SEEDANCE_FAST = 'bytedance/seedance-2.0/fast/text-to-video';
 const FAL_SEEDANCE = 'bytedance/seedance-2.0/text-to-video';
+const FAL_SEEDANCE_US = 'bytedance/seedance-2.0/us/text-to-video';
 const FAL_WAN3 = 'alibaba/wan-3.0/text-to-video';
+const FAL_WAN22 = 'fal-ai/wan/v2.2-a14b/text-to-video';
 const FAL_QUEUE = 'https://queue.fal.run/';
+
+function falKey(env) {
+  let k = env.FAL_KEY || env.FAL_API_KEY || '';
+  k = String(k).trim();
+  // évite "Key Key xxx" si le secret contient déjà le préfixe
+  if (/^Key\s+/i.test(k)) k = k.replace(/^Key\s+/i, '').trim();
+  return k;
+}
+
+function falErr(data, status) {
+  if (data == null) return `Fal HTTP ${status || '?'}`;
+  if (typeof data === 'string') return data.slice(0, 280);
+  const d = data.detail || data.error || data.message || data.msg;
+  if (typeof d === 'string') return d.slice(0, 280);
+  if (Array.isArray(d)) {
+    try {
+      return d
+        .map((x) => (typeof x === 'string' ? x : x?.msg || x?.message || JSON.stringify(x)))
+        .join(' · ')
+        .slice(0, 280);
+    } catch (e) {}
+  }
+  if (d && typeof d === 'object') {
+    try {
+      return JSON.stringify(d).slice(0, 280);
+    } catch (e) {}
+  }
+  try {
+    return JSON.stringify(data).slice(0, 280);
+  } catch (e) {
+    return `Fal HTTP ${status || '?'}`;
+  }
+}
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -446,8 +481,8 @@ function mapFalAspect(fmt) {
 }
 
 async function submitFalVideo(modelId, prompt, opts, env) {
-  const key = env.FAL_KEY;
-  if (!key) return { ok: false, error: 'FAL_KEY manquante' };
+  const key = falKey(env);
+  if (!key) return { ok: false, error: 'FAL_KEY manquante — ajoute le secret Cloudflare FAL_KEY' };
   const duration = mapFalDuration(opts?.duration || 5);
   const resolution = String(opts?.quality || opts?.resolution || '720p').toLowerCase().includes('1080')
     ? '1080p'
@@ -470,40 +505,49 @@ async function submitFalVideo(modelId, prompt, opts, env) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      return {
-        ok: false,
-        error:
-          data.detail ||
-          data.error ||
-          data.message ||
-          (typeof data === 'string' ? data : `Fal HTTP ${res.status}`),
-        raw: data,
-      };
+      return { ok: false, error: falErr(data, res.status), raw: data, fal_model: modelId };
     }
     const requestId = data.request_id || data.requestId || data.id;
-    if (!requestId) return { ok: false, error: 'Fal: pas de request_id', raw: data };
+    if (!requestId) return { ok: false, error: 'Fal: pas de request_id', raw: data, fal_model: modelId };
+    const prov = modelId.includes('seedance')
+      ? 'seedance'
+      : modelId.includes('wan')
+        ? 'wan'
+        : 'fal';
     return {
       ok: true,
-      provider: modelId.includes('seedance') ? 'seedance' : 'wan3',
+      provider: prov,
       fal_model: modelId,
       request_id: requestId,
       status: 'queued',
     };
   } catch (e) {
-    return { ok: false, error: e.message || String(e) };
+    return { ok: false, error: e.message || String(e), fal_model: modelId };
   }
 }
 
 async function pollFalOnce(requestId, modelId, env) {
-  const key = env.FAL_KEY;
+  const key = falKey(env);
   if (!key) return { ok: false, status: 'FAILED', error: 'FAL_KEY manquante' };
   const base = FAL_QUEUE + modelId + '/requests/' + encodeURIComponent(requestId);
+  const prov = modelId.includes('seedance')
+    ? 'seedance'
+    : modelId.includes('wan')
+      ? 'wan'
+      : 'fal';
   try {
-    // status
     const stRes = await fetch(base + '/status', {
       headers: { Authorization: `Key ${key}` },
     });
     const stData = await stRes.json().catch(() => ({}));
+    if (!stRes.ok) {
+      return {
+        ok: false,
+        status: 'FAILED',
+        error: falErr(stData, stRes.status),
+        fal_model: modelId,
+      };
+    }
     const status = String(stData.status || stData.state || '').toUpperCase();
 
     if (status === 'COMPLETED' || status === 'OK') {
@@ -513,16 +557,17 @@ async function pollFalOnce(requestId, modelId, env) {
         data.video?.url ||
         data.video_url ||
         data.output?.video?.url ||
-        data.response?.video?.url;
+        data.response?.video?.url ||
+        data.payload?.video?.url;
       if (!videoUrl) {
-        return { ok: false, status: 'FAILED', error: 'Fal terminé sans URL', raw: data };
+        return { ok: false, status: 'FAILED', error: 'Fal terminé sans URL', raw: data, fal_model: modelId };
       }
       return {
         ok: true,
         status: 'COMPLETED',
         video_url: videoUrl,
         url: videoUrl,
-        provider: modelId.includes('seedance') ? 'seedance' : 'wan3',
+        provider: prov,
         fal_model: modelId,
       };
     }
@@ -530,43 +575,44 @@ async function pollFalOnce(requestId, modelId, env) {
       return {
         ok: false,
         status: 'FAILED',
-        error: stData.error || stData.detail || 'Fal failed',
+        error: falErr(stData, 0) || 'Fal failed',
         raw: stData,
+        fal_model: modelId,
       };
     }
-    // IN_QUEUE / IN_PROGRESS
     return {
       ok: true,
       status: 'PROCESSING',
       progress: stData.queue_position != null ? Math.max(0, 100 - stData.queue_position * 10) : 10,
-      provider: modelId.includes('seedance') ? 'seedance' : 'wan3',
+      provider: prov,
       fal_model: modelId,
     };
   } catch (e) {
-    return { ok: false, status: 'FAILED', error: e.message || String(e) };
+    return { ok: false, status: 'FAILED', error: e.message || String(e), fal_model: modelId };
   }
 }
 
 async function submitFluxionFal(prompt, opts, env) {
-  if (!env.FAL_KEY) return { ok: false, error: 'FAL_KEY manquante' };
-  // 1) Seedance fast (moins cher)
-  const fast = await submitFalVideo(FAL_SEEDANCE_FAST, prompt, opts, env);
-  if (fast.ok) return fast;
-  // 2) Seedance standard
-  const full = await submitFalVideo(FAL_SEEDANCE, prompt, opts, env);
-  if (full.ok) {
-    full.seedance_fast_error = fast.error;
-    return full;
-  }
-  // 3) Wan 3
-  const wan = await submitFalVideo(FAL_WAN3, prompt, opts, env);
-  if (wan.ok) {
-    wan.seedance_error = full.error || fast.error;
-    return wan;
+  if (!falKey(env)) return { ok: false, error: 'FAL_KEY manquante — secret Cloudflare FAL_KEY' };
+  const models = [
+    FAL_SEEDANCE_FAST,
+    FAL_SEEDANCE,
+    FAL_SEEDANCE_US,
+    FAL_WAN3,
+    FAL_WAN22,
+  ];
+  const errors = [];
+  for (const m of models) {
+    const r = await submitFalVideo(m, prompt, opts, env);
+    if (r.ok) {
+      if (errors.length) r.prev_errors = errors.slice(0, 3);
+      return r;
+    }
+    errors.push((m.split('/').pop() || m) + ': ' + (r.error || 'fail'));
   }
   return {
     ok: false,
-    error: wan.error || full.error || fast.error || 'Fal indisponible',
+    error: errors.slice(0, 4).join(' | ') || 'Fal indisponible',
   };
 }
 
@@ -597,7 +643,7 @@ async function runSonaria(prompt, opts, env) {
     const a = msg.audio;
     if (Array.isArray(a) && a.length) {
       const first = a[0];
-      return (
+  return (
         first?.audio_url?.url ||
         first?.url ||
         (typeof first === 'string' ? first : null)
@@ -792,13 +838,13 @@ export default {
         ok: true,
         service: 'elion-relay',
         chat: env.AI ? 'workers-ai→gemini' : (pickGeminiKey(env) ? 'gemini' : 'off'),
-        fluxion_primary: env.FAL_KEY ? 'seedance-2.0' : 'off',
-        fluxion_fallback: env.FAL_KEY ? 'wan-3' : 'off',
+        fluxion_primary: falKey(env) ? 'seedance-2.0' : 'off',
+        fluxion_fallback: falKey(env) ? 'wan-3' : 'off',
         fluxion_fallback2: env.AI ? 'workers-ai' : 'off',
         sonaria: env.ACE_MUSIC_API_KEY ? 'ace' : 'off',
         illustro: env.AI ? 'flux-2' : 'off',
         has_ai_binding: !!env.AI,
-        has_fal: !!env.FAL_KEY,
+        has_fal: !!falKey(env),
         has_gemini: !!pickGeminiKey(env),
         has_groq: !!env.GROQ_API_KEY,
         tip: 'Teste la clé: GET /?ping=gemini',
@@ -879,10 +925,17 @@ export default {
           });
         }
 
-        if (provider === 'seedance' || provider === 'wan3' || falModel || env.FAL_KEY) {
+        if (
+          provider === 'seedance' ||
+          provider === 'wan3' ||
+          provider === 'wan' ||
+          provider === 'fal' ||
+          falModel ||
+          falKey(env)
+        ) {
           const model =
             falModel ||
-            (provider === 'wan3' ? FAL_WAN3 : FAL_SEEDANCE_FAST);
+            (provider === 'wan3' || provider === 'wan' ? FAL_WAN3 : FAL_SEEDANCE_FAST);
           return json(await pollFalOnce(id, model, env));
         }
 

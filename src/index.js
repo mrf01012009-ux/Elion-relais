@@ -1,7 +1,7 @@
 /**
  * ElionAI Relay — Cloudflare Worker
- * Fluxion: Workers AI (Flux 3 Video) → Agnes Flash → LTX
- * Secrets: AGNES_API_KEY, PIXAZO_API_KEY, ACE_MUSIC_API_KEY, GROQ_API_KEY,
+ * Fluxion: Seedance 2.0 (Fal) → Wan 3 (Fal) → Workers AI
+ * Secrets: FAL_KEY, ACE_MUSIC_API_KEY, GROQ_API_KEY,
  *          GEMINI_API_KEY (ou GEMINI_API_KEY_2)
  * Binding: AI
  */
@@ -12,15 +12,13 @@ const CORS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
 
-const AGNES_BASE = 'https://apihub.agnes-ai.com';
-const AGNES_MODEL = 'agnes-video-2.5-flash';
-const LTX_SUBMIT = [
-  'https://gateway.pixazo.ai/ltx-2-5-pro/v1/text-to-video',
-  'https://gateway.pixazo.ai/ltx-2-5-lite/v1/text-to-video',
-  'https://gateway.pixazo.ai/ltx-video/v1/text-to-video',
-];
-const LTX_STATUS = 'https://gateway.pixazo.ai/v2/requests/status/';
 const ACE_CHAT_URL = 'https://api.acemusic.ai/v1/chat/completions';
+
+/* Fal — Seedance 2.0 + Wan 3 */
+const FAL_SEEDANCE_FAST = 'bytedance/seedance-2.0/fast/text-to-video';
+const FAL_SEEDANCE = 'bytedance/seedance-2.0/text-to-video';
+const FAL_WAN3 = 'alibaba/wan-3.0/text-to-video';
+const FAL_QUEUE = 'https://queue.fal.run/';
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -428,144 +426,148 @@ async function submitFluxionWorkersAI(prompt, opts, env) {
   return { ok: false, error: lastErr };
 }
 
-/* ─── Agnes ─── */
-function mapAgnesSeconds(d) {
+/* ─── Fal (Seedance 2.0 + Wan 3) ─── */
+function mapFalDuration(d) {
   const n = Number(d) || 5;
   if (n <= 4) return '4';
-  if (n <= 5) return '5';
   if (n <= 6) return '6';
   if (n <= 8) return '8';
   if (n <= 10) return '10';
-  return '12';
+  if (n <= 12) return '12';
+  return '15';
 }
-function mapAgnesAspect(fmt) {
+function mapFalAspect(fmt) {
   const f = String(fmt || '').toLowerCase();
   if (f.includes('9:16') || f.includes('portrait')) return '9:16';
   if (f.includes('1:1')) return '1:1';
+  if (f.includes('4:3')) return '4:3';
+  if (f.includes('3:4')) return '3:4';
   return '16:9';
 }
 
-async function submitFluxionAgnes(prompt, opts, env) {
-  const key = env.AGNES_API_KEY;
-  if (!key) return { ok: false, error: 'AGNES_API_KEY manquante' };
-  const res = await fetch(`${AGNES_BASE}/v1/videos`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${key}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: AGNES_MODEL,
-      prompt: String(prompt || '').slice(0, 2000),
-      mode: 'text',
-      seconds: mapAgnesSeconds(opts?.duration || 5),
-      size: '720P',
-      aspect_ratio: mapAgnesAspect(opts?.aspect || '16:9'),
-    }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    return {
-      ok: false,
-      error: data.detail || data.error?.message || data.message || `Agnes HTTP ${res.status}`,
-      raw: data,
-    };
-  }
-  const videoId = data.video_id || data.id;
-  if (!videoId) return { ok: false, error: 'Agnes: pas de video_id', raw: data };
-  return { ok: true, provider: 'agnes-flash', video_id: videoId, request_id: videoId };
-}
-
-async function pollAgnesOnce(videoId, env) {
-  const key = env.AGNES_API_KEY;
-  if (!key) return { ok: false, status: 'FAILED', error: 'AGNES_API_KEY manquante' };
-  const url =
-    `${AGNES_BASE}/agnesapi?video_id=${encodeURIComponent(videoId)}` +
-    `&model_name=${encodeURIComponent(AGNES_MODEL)}`;
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${key}` } });
-  const data = await res.json().catch(() => ({}));
-  const status = String(data.status || '').toLowerCase();
-  if (['completed', 'succeeded', 'success', 'done'].includes(status)) {
-    const videoUrl = data.url || data.video_url;
-    if (!videoUrl) return { ok: false, status: 'FAILED', error: 'sans url', raw: data };
+async function submitFalVideo(modelId, prompt, opts, env) {
+  const key = env.FAL_KEY;
+  if (!key) return { ok: false, error: 'FAL_KEY manquante' };
+  const duration = mapFalDuration(opts?.duration || 5);
+  const resolution = String(opts?.quality || opts?.resolution || '720p').toLowerCase().includes('1080')
+    ? '1080p'
+    : '720p';
+  const body = {
+    prompt: String(prompt || '').slice(0, 2000),
+    duration,
+    resolution,
+    aspect_ratio: mapFalAspect(opts?.aspect || '16:9'),
+    generate_audio: opts?.sound !== false,
+  };
+  try {
+    const res = await fetch(FAL_QUEUE + modelId, {
+      method: 'POST',
+      headers: {
+        Authorization: `Key ${key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      return {
+        ok: false,
+        error:
+          data.detail ||
+          data.error ||
+          data.message ||
+          (typeof data === 'string' ? data : `Fal HTTP ${res.status}`),
+        raw: data,
+      };
+    }
+    const requestId = data.request_id || data.requestId || data.id;
+    if (!requestId) return { ok: false, error: 'Fal: pas de request_id', raw: data };
     return {
       ok: true,
-      status: 'COMPLETED',
-      video_url: videoUrl,
-      url: videoUrl,
-      provider: 'agnes-flash',
+      provider: modelId.includes('seedance') ? 'seedance' : 'wan3',
+      fal_model: modelId,
+      request_id: requestId,
+      status: 'queued',
     };
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
   }
-  if (['failed', 'error', 'cancelled'].includes(status)) {
-    return {
-      ok: false,
-      status: 'FAILED',
-      error: data.error?.message || data.error || data.detail || 'Agnes failed',
-      raw: data,
-    };
-  }
-  return { ok: true, status: 'PROCESSING', progress: data.progress || 0, provider: 'agnes-flash' };
 }
 
-/* ─── LTX ─── */
-async function submitFluxionLtx(prompt, opts, env) {
-  const key = env.PIXAZO_API_KEY;
-  if (!key) return { ok: false, error: 'PIXAZO_API_KEY manquante' };
-  const payload = {
-    prompt: String(prompt || '').slice(0, 1500),
-    duration: Math.min(8, Math.max(3, Number(opts?.duration) || 5)),
-  };
-  let lastErr = 'LTX unavailable';
-  for (const endpoint of LTX_SUBMIT) {
-    try {
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${key}`,
-          'Content-Type': 'application/json',
-          'x-api-key': key,
-        },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        lastErr = data.message || data.error || `LTX HTTP ${res.status}`;
-        continue;
+async function pollFalOnce(requestId, modelId, env) {
+  const key = env.FAL_KEY;
+  if (!key) return { ok: false, status: 'FAILED', error: 'FAL_KEY manquante' };
+  const base = FAL_QUEUE + modelId + '/requests/' + encodeURIComponent(requestId);
+  try {
+    // status
+    const stRes = await fetch(base + '/status', {
+      headers: { Authorization: `Key ${key}` },
+    });
+    const stData = await stRes.json().catch(() => ({}));
+    const status = String(stData.status || stData.state || '').toUpperCase();
+
+    if (status === 'COMPLETED' || status === 'OK') {
+      const rRes = await fetch(base, { headers: { Authorization: `Key ${key}` } });
+      const data = await rRes.json().catch(() => ({}));
+      const videoUrl =
+        data.video?.url ||
+        data.video_url ||
+        data.output?.video?.url ||
+        data.response?.video?.url;
+      if (!videoUrl) {
+        return { ok: false, status: 'FAILED', error: 'Fal terminé sans URL', raw: data };
       }
-      const requestId = data.request_id || data.id || data.job_id || data.data?.request_id;
-      if (!requestId) {
-        lastErr = 'LTX: pas de request_id';
-        continue;
-      }
-      return { ok: true, provider: 'ltx', request_id: requestId };
-    } catch (e) {
-      lastErr = e.message || String(e);
+      return {
+        ok: true,
+        status: 'COMPLETED',
+        video_url: videoUrl,
+        url: videoUrl,
+        provider: modelId.includes('seedance') ? 'seedance' : 'wan3',
+        fal_model: modelId,
+      };
     }
+    if (['FAILED', 'ERROR', 'CANCELLED'].includes(status)) {
+      return {
+        ok: false,
+        status: 'FAILED',
+        error: stData.error || stData.detail || 'Fal failed',
+        raw: stData,
+      };
+    }
+    // IN_QUEUE / IN_PROGRESS
+    return {
+      ok: true,
+      status: 'PROCESSING',
+      progress: stData.queue_position != null ? Math.max(0, 100 - stData.queue_position * 10) : 10,
+      provider: modelId.includes('seedance') ? 'seedance' : 'wan3',
+      fal_model: modelId,
+    };
+  } catch (e) {
+    return { ok: false, status: 'FAILED', error: e.message || String(e) };
   }
-  return { ok: false, error: lastErr };
 }
 
-async function pollLtxOnce(requestId, env) {
-  const key = env.PIXAZO_API_KEY;
-  if (!key) return { ok: false, status: 'FAILED', error: 'PIXAZO_API_KEY manquante' };
-  const res = await fetch(LTX_STATUS + encodeURIComponent(requestId), {
-    headers: { Authorization: `Bearer ${key}`, 'x-api-key': key },
-  });
-  const data = await res.json().catch(() => ({}));
-  const st = String(data.status || data.state || '').toLowerCase();
-  const videoUrl =
-    data.video_url ||
-    data.url ||
-    data.output?.url ||
-    data.result?.url ||
-    (Array.isArray(data.outputs) && data.outputs[0]?.url);
-  if (videoUrl && (st.includes('success') || st.includes('complete') || st === 'done')) {
-    return { ok: true, status: 'COMPLETED', video_url: videoUrl, url: videoUrl, provider: 'ltx' };
+async function submitFluxionFal(prompt, opts, env) {
+  if (!env.FAL_KEY) return { ok: false, error: 'FAL_KEY manquante' };
+  // 1) Seedance fast (moins cher)
+  const fast = await submitFalVideo(FAL_SEEDANCE_FAST, prompt, opts, env);
+  if (fast.ok) return fast;
+  // 2) Seedance standard
+  const full = await submitFalVideo(FAL_SEEDANCE, prompt, opts, env);
+  if (full.ok) {
+    full.seedance_fast_error = fast.error;
+    return full;
   }
-  if (st.includes('fail') || st.includes('error')) {
-    return { ok: false, status: 'FAILED', error: data.message || data.error || 'LTX failed' };
+  // 3) Wan 3
+  const wan = await submitFalVideo(FAL_WAN3, prompt, opts, env);
+  if (wan.ok) {
+    wan.seedance_error = full.error || fast.error;
+    return wan;
   }
-  return { ok: true, status: 'PROCESSING', provider: 'ltx' };
+  return {
+    ok: false,
+    error: wan.error || full.error || fast.error || 'Fal indisponible',
+  };
 }
 
 /* ─── Sonaria / Illustro ─── */
@@ -622,7 +624,7 @@ async function runSonaria(prompt, opts, env) {
       {
         model,
         messages: [{ role: 'user', content: text }],
-       stream: false,
+        stream: false,
         audio_config: { duration, format: 'mp3', instrumental: true },
       },
     ];
@@ -790,13 +792,13 @@ export default {
         ok: true,
         service: 'elion-relay',
         chat: env.AI ? 'workers-ai→gemini' : (pickGeminiKey(env) ? 'gemini' : 'off'),
-        fluxion_primary: env.AI ? 'workers-ai-flux3-video' : 'off',
-        fluxion_fallback: env.AGNES_API_KEY ? 'agnes-flash' : 'off',
-        fluxion_fallback2: env.PIXAZO_API_KEY ? 'ltx' : 'off',
+        fluxion_primary: env.FAL_KEY ? 'seedance-2.0' : 'off',
+        fluxion_fallback: env.FAL_KEY ? 'wan-3' : 'off',
+        fluxion_fallback2: env.AI ? 'workers-ai' : 'off',
         sonaria: env.ACE_MUSIC_API_KEY ? 'ace' : 'off',
         illustro: env.AI ? 'flux-2' : 'off',
         has_ai_binding: !!env.AI,
-        has_agnes: !!env.AGNES_API_KEY,
+        has_fal: !!env.FAL_KEY,
         has_gemini: !!pickGeminiKey(env),
         has_groq: !!env.GROQ_API_KEY,
         tip: 'Teste la clé: GET /?ping=gemini',
@@ -826,7 +828,20 @@ export default {
           image_url: body.image_url,
         };
 
-        // 1) Workers AI Flux 3 Video
+        // 1) Fal Seedance 2.0 → Wan 3
+        const fal = await submitFluxionFal(prompt, opts, env);
+        if (fal.ok) {
+          return json({
+            ok: true,
+            request_id: fal.request_id,
+            id: fal.request_id,
+            provider: fal.provider,
+            fal_model: fal.fal_model,
+            status: 'queued',
+          });
+        }
+
+        // 2) Workers AI Flux 3 Video
         const cf = await submitFluxionWorkersAI(prompt, opts, env);
         if (cf.ok && cf.video_url) {
           return json({
@@ -837,40 +852,14 @@ export default {
             status: 'COMPLETED',
             video_url: cf.video_url,
             url: cf.video_url,
-          });
-        }
-
-        // 2) Agnes
-        const agnes = await submitFluxionAgnes(prompt, opts, env);
-        if (agnes.ok) {
-          return json({
-            ok: true,
-            request_id: agnes.request_id || agnes.video_id,
-            id: agnes.video_id,
-            provider: 'agnes-flash',
-            status: 'queued',
-            workers_ai_error: cf.error,
-          });
-        }
-
-        // 3) LTX
-        const ltx = await submitFluxionLtx(prompt, opts, env);
-        if (ltx.ok) {
-          return json({
-            ok: true,
-            request_id: ltx.request_id,
-            id: ltx.request_id,
-            provider: 'ltx',
-            status: 'queued',
-            workers_ai_error: cf.error,
-            agnes_error: agnes.error,
+            fal_error: fal.error,
           });
         }
 
         return json(
           {
             ok: false,
-            error: cf.error || agnes.error || ltx.error || 'Fluxion indisponible',
+            error: fal.error || cf.error || 'Fluxion indisponible',
           },
           502
         );
@@ -880,6 +869,7 @@ export default {
       if (body.ltx_status) {
         const id = String(body.ltx_status);
         const provider = String(body.provider || '');
+        const falModel = String(body.fal_model || '');
 
         if (id.startsWith('cf-done-')) {
           return json({
@@ -889,24 +879,13 @@ export default {
           });
         }
 
-        if (provider === 'ltx') return json(await pollLtxOnce(id, env));
-
-        if (provider === 'agnes-flash' || !provider) {
-          if (env.AGNES_API_KEY) {
-            const once = await pollAgnesOnce(id, env);
-            if (
-              once.status === 'FAILED' &&
-              !provider &&
-              env.PIXAZO_API_KEY &&
-              /not found/i.test(String(once.error || ''))
-            ) {
-              return json(await pollLtxOnce(id, env));
-            }
-            return json(once);
-          }
+        if (provider === 'seedance' || provider === 'wan3' || falModel || env.FAL_KEY) {
+          const model =
+            falModel ||
+            (provider === 'wan3' ? FAL_WAN3 : FAL_SEEDANCE_FAST);
+          return json(await pollFalOnce(id, model, env));
         }
 
-        if (env.PIXAZO_API_KEY) return json(await pollLtxOnce(id, env));
         return json({ status: 'FAILED', error: 'no poll provider' }, 500);
       }
 
@@ -958,4 +937,3 @@ export default {
     }
   },
 };
-                       

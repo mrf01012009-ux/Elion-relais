@@ -1,6 +1,6 @@
 /**
  * ElionAI Relay — Cloudflare Worker
- * Fluxion: Rewind (Seedance 1.5 Pro) → Seedance 2.0 (Fal) → Wan 3 (Fal) → Workers AI
+ * Fluxion: Rewind (Wan 3.0) → Seedance 2.0 (Fal) → Wan 3 (Fal) → Workers AI
  * Secrets: REWIND_API_KEY, FAL_KEY, ACE_MUSIC_API_KEY, GROQ_API_KEY,
  *          GEMINI_API_KEY (ou GEMINI_API_KEY_2)
  * Binding: AI
@@ -24,7 +24,7 @@ const FAL_QUEUE = 'https://queue.fal.run/';
 
 /* Rewind API — vidéo async (POST /videos/generate-async → GET /jobs/:id) */
 const REWIND_BASE = 'https://api.rewind.ai/v1';
-const REWIND_VIDEO_MODEL = 'bytedance/seedance-1-5-pro';
+const REWIND_VIDEO_MODEL = 'alibaba/wan-3.0';
 
 function rewindKey(env) {
   let k = String(env.REWIND_API_KEY || '').trim();
@@ -525,7 +525,7 @@ async function submitRewindVideo(prompt, opts, env) {
         prompt: String(prompt || '').slice(0, 1500),
         duration: dur + 's',
         aspectRatio: mapFalAspect(opts?.aspect || '16:9'),
-        model: REWIND_VIDEO_MODEL,
+        model: String(env.REWIND_VIDEO_MODEL || REWIND_VIDEO_MODEL).trim(),
       }),
     });
     const data = await res.json().catch(() => ({}));
@@ -534,7 +534,7 @@ async function submitRewindVideo(prompt, opts, env) {
       data.job_id || data.jobId || data.id || data.request_id ||
       data.data?.job_id || data.data?.id || data.job?.id;
     if (!id) return { ok: false, error: 'Rewind: pas de job id — ' + JSON.stringify(data).slice(0, 160), raw: data };
-    return { ok: true, request_id: String(id), provider: 'rewind' };
+    return { ok: true, request_id: 'rw-' + String(id), provider: 'rewind' };
   } catch (e) {
     return { ok: false, error: e.message || String(e) };
   }
@@ -602,8 +602,7 @@ async function submitFalVideo(modelId, prompt, opts, env) {
   };
   try {
     const res = await fetch(FAL_QUEUE + modelId, {
-      method: 'POST',
-      headers: {
+    headers: {
         Authorization: `Key ${key}`,
         'Content-Type': 'application/json',
       },
@@ -945,7 +944,7 @@ export default {
         ok: true,
         service: 'elion-relay',
         chat: env.AI ? 'workers-ai→gemini' : (pickGeminiKey(env) ? 'gemini' : 'off'),
-        fluxion_primary: rewindKey(env) ? 'rewind-seedance-1.5' : (falKey(env) ? 'seedance-2.0' : 'off'),
+        fluxion_primary: rewindKey(env) ? 'rewind-wan-3.0' : (falKey(env) ? 'seedance-2.0' : 'off'),
         fluxion_fallback: falKey(env) ? 'wan-3' : 'off',
         fluxion_fallback2: env.AI ? 'workers-ai' : 'off',
         sonaria: env.ACE_MUSIC_API_KEY ? 'ace' : 'off',
@@ -982,7 +981,7 @@ export default {
           image_url: body.image_url,
         };
 
-        // 0) Rewind (Seedance 1.5 Pro)
+        // 0) Rewind (Wan 3.0)
         let rw = { ok: false, error: '' };
         if (rewindKey(env)) {
           rw = await submitRewindVideo(prompt, opts, env);
@@ -1030,7 +1029,11 @@ export default {
           {
             ok: false,
             error:
-              [rw.error && 'Rewind: ' + rw.error, fal.error && 'Fal: ' + fal.error, cf.error && 'CF: ' + cf.error]
+              [
+                rw.error && 'Rewind: ' + String(rw.error).slice(0, 60),
+                fal.error && 'Fal: ' + (/exhausted|balance|locked/i.test(fal.error) ? 'crédits épuisés' : String(fal.error).slice(0, 40)),
+                cf.error && 'CF: ' + String(cf.error).slice(0, 60),
+              ]
                 .filter(Boolean)
                 .join(' | ') || 'Fluxion indisponible',
           },
@@ -1052,8 +1055,9 @@ export default {
           });
         }
 
-        if (provider === 'rewind') {
-          return json(await pollRewindOnce(id, env));
+        // préfixe rw- : la page Works n'envoie pas "provider" au polling
+        if (provider === 'rewind' || id.startsWith('rw-')) {
+          return json(await pollRewindOnce(id.replace(/^rw-/, ''), env));
         }
 
         if (
@@ -1121,3 +1125,4 @@ export default {
     }
   },
 };
+        

@@ -1,9 +1,10 @@
 /**
  * ElionAI Relay — Cloudflare Worker
- * Fluxion: Rewind (Wan 3.0) → Seedance 2.0 (Fal) → Wan 3 (Fal) → Workers AI
- * Secrets: REWIND_API_KEY, FAL_KEY, ACE_MUSIC_API_KEY, GROQ_API_KEY,
- *          GEMINI_API_KEY (ou GEMINI_API_KEY_2)
- * Binding: AI
+ * Chat modes → Cloudflare Workers AI (principal)
+ * Vision → Gemini (optionnel, images/PDF uniquement)
+ * Fluxion: en pause côté app (Fal optionnel)
+ * Secrets: ACE_MUSIC_API_KEY, GEMINI_API_KEY (vision), FAL_KEY (optionnel)
+ * Binding: AI (obligatoire pour le chat)
  */
 
 const CORS = {
@@ -21,16 +22,6 @@ const FAL_SEEDANCE_US = 'bytedance/seedance-2.0/us/text-to-video';
 const FAL_WAN3 = 'alibaba/wan-3.0/text-to-video';
 const FAL_WAN22 = 'fal-ai/wan/v2.2-a14b/text-to-video';
 const FAL_QUEUE = 'https://queue.fal.run/';
-
-/* Rewind API — vidéo async (POST /videos/generate-async → GET /jobs/:id) */
-const REWIND_BASE = 'https://api.rewind.ai/v1';
-const REWIND_VIDEO_MODEL = 'alibaba/wan-3.0';
-
-function rewindKey(env) {
-  let k = String(env.REWIND_API_KEY || '').trim();
-  if (/^Bearer\s+/i.test(k)) k = k.replace(/^Bearer\s+/i, '').trim();
-  return k;
-}
 
 function falKey(env) {
   let k = env.FAL_KEY || env.FAL_API_KEY || '';
@@ -192,6 +183,8 @@ async function streamChatWorkersAI(body, env) {
       'Tu es ElionAI en mode réflexion. Commence TOUJOURS par un raisonnement détaillé et utile sur la question de l\'utilisateur (faits, hypothèses, étapes), puis donne la réponse finale. Écris le raisonnement en français, concret, lié à la question posée — pas de phrases génériques.',
   });
   const models = [
+    '@cf/deepseek-ai/deepseek-v4.1-flash-1017',
+    '@cf/qwen/qwen3.8-27b',
     '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
     '@cf/meta/llama-3.1-8b-instruct-fast',
   ];
@@ -221,8 +214,43 @@ async function streamChatWorkersAI(body, env) {
   return null;
 }
 
+/** Listes de modèles Workers AI par mode Elion */
+function modelsForMode(mode) {
+  const MODELS = {
+    smart: [
+      '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+      '@cf/google/gemma-4-26b-a4b-it',
+      '@cf/meta/llama-3.1-8b-instruct-fast',
+      '@cf/meta/llama-3.1-8b-instruct-fp8',
+    ],
+    search: [
+      '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+      '@cf/google/gemma-4-26b-a4b-it',
+      '@cf/meta/llama-3.1-8b-instruct-fast',
+    ],
+    writer: [
+      '@cf/google/gemma-4-26b-a4b-it',
+      '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+      '@cf/meta/llama-3.1-8b-instruct-fast',
+    ],
+    think: [
+      '@cf/deepseek-ai/deepseek-v4.1-flash-1017',
+      '@cf/qwen/qwen3.8-27b',
+      '@cf/zai-org/glm-4.7-flash',
+      '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+    ],
+    architect: [
+      '@cf/deepseek-ai/deepseek-v4.1-flash-1017',
+      '@cf/qwen/qwen3.8-27b',
+      '@cf/zai-org/glm-4.7-flash',
+      '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+    ],
+  };
+  return MODELS[mode] || MODELS.smart;
+}
+
 async function proxyGemini(body, env) {
-  // Vision / images → Gemini uniquement
+  // Vision / images / PDF → Gemini uniquement
   const hasImage = !!(
     body.has_image ||
     body.force_vision ||
@@ -235,13 +263,10 @@ async function proxyGemini(body, env) {
   );
 
   /*
-   * Routing modes Elion :
-   *  smart     → Llama 3.3 70B (Workers AI)
-   *  search    → Gemini
-   *  think     → DeepSeek (Workers AI) → Gemini
-   *  architect → DeepSeek (Workers AI) → Gemini
-   *  writer    → Gemini
-   *  vision    → Gemini
+   * Routing modes Elion (chat texte) → Workers AI
+   *  smart / search / writer → Llama 3.3 / Gemma 4
+   *  think / architect      → DeepSeek / Qwen / GLM
+   *  vision                 → Gemini (si clé)
    */
   const mode = String(body.elion_mode || body.mode || 'smart').toLowerCase();
 
@@ -256,32 +281,11 @@ async function proxyGemini(body, env) {
     if (streamed) return streamed;
   }
 
-  if (hasImage || body.force_vision) {
-    // vision → Gemini only below
-  } else if (mode === 'smart' || mode === 'mellowcore' || !mode) {
-    // Smart → Llama 3.3 70B (puis 8B fast si besoin)
-    if (env.AI && !body.force_gemini) {
-      const w = await chatWorkersAI(body, env, [
-        '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-        '@cf/meta/llama-3.1-8b-instruct-fast',
-        '@cf/meta/llama-3.1-8b-instruct-fp8',
-        '@cf/meta/llama-3.2-3b-instruct',
-      ]);
-      if (w && w.candidates) return json(w);
-    }
-    // Groq secours si Workers AI KO
-    if (env.GROQ_API_KEY) {
-      const gr = await chatGroq(body, env);
-      if (gr) return json(gr);
-    }
-  } else if (mode === 'think' || mode === 'architect') {
-    if (env.AI && !body.force_gemini) {
-      const w = await chatWorkersAI(body, env, [
-        '@cf/deepseek-ai/deepseek-v4-flash-0731',
-        '@cf/qwen/qwen3.8-27b',
-        '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-        '@cf/meta/llama-3.1-8b-instruct-fast',
-      ]);
+  // ── Chat texte : Workers AI d'abord ──
+  if (!hasImage && !body.force_vision && !body.force_gemini) {
+    if (env.AI) {
+      const list = modelsForMode(mode === 'mellowcore' ? 'smart' : mode);
+      const w = await chatWorkersAI(body, env, list);
       if (w && w.candidates) return json(w);
     }
     if (env.GROQ_API_KEY) {
@@ -289,22 +293,28 @@ async function proxyGemini(body, env) {
       if (gr) return json(gr);
     }
   }
-  // search + writer → Gemini ; sinon fallbacks
 
+  // ── Vision (ou force_gemini / secours ultime) → Gemini ──
   const key = pickGeminiKey(env);
   if (!key) {
-    if (env.AI) {
-      const w = await chatWorkersAI(body, env, [
-        '@cf/meta/llama-3.1-8b-instruct-fast',
-        '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-      ]);
+    if (!hasImage && env.AI) {
+      const w = await chatWorkersAI(body, env, modelsForMode('smart'));
       if (w && w.candidates) return json(w);
     }
     if (env.GROQ_API_KEY) {
       const gr = await chatGroq(body, env);
       if (gr) return json(gr);
     }
-    return json({ error: { message: 'Aucun modèle disponible (Workers AI / Gemini / Groq)' } }, 500);
+    return json(
+      {
+        error: {
+          message: hasImage
+            ? "Analyse d'image indisponible (pas de clé Gemini)"
+            : 'Aucun modèle disponible (Workers AI / Groq)',
+        },
+      },
+      500
+    );
   }
 
   const models = [
@@ -312,7 +322,6 @@ async function proxyGemini(body, env) {
     'gemini-flash-latest',
     'gemini-2.5-flash',
     'gemini-2.5-flash-lite',
-    'gemini-3.8-flash',
   ].filter(Boolean);
 
   const payload = { contents: body.contents || [] };
@@ -341,7 +350,6 @@ async function proxyGemini(body, env) {
       lastStatus = res.status;
       lastErr = data?.error?.message || data?.message || `Gemini HTTP ${res.status}`;
       if (res.status === 429) return json(data, 429);
-      // Clé invalide → inutile d'essayer d'autres modèles Gemini
       if (/API key not valid|INVALID_ARGUMENT|invalid api key/i.test(String(lastErr))) {
         break;
       }
@@ -349,53 +357,21 @@ async function proxyGemini(body, env) {
       lastErr = e.message || String(e);
     }
   }
-  // Secours Groq si Gemini KO
-  if (env.GROQ_API_KEY && Array.isArray(body.contents)) {
-    try {
-      const messages = [];
-      if (body.system_instruction && body.system_instruction.parts) {
-        const st = (body.system_instruction.parts || []).map((p) => p.text || '').join('\n');
-        if (st) messages.push({ role: 'system', content: st.slice(0, 8000) });
-      }
-      for (const c of body.contents) {
-        const role = c.role === 'model' ? 'assistant' : 'user';
-        const text = (c.parts || []).map((p) => p.text || '').filter(Boolean).join('\n');
-        if (text) messages.push({ role, content: text.slice(0, 12000) });
-      }
-      if (messages.length) {
-        const gRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            Authorization: 'Bearer ' + env.GROQ_API_KEY,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model: 'llama-3.3-70b-versatile',
-            messages,
-            temperature: 0.7,
-          }),
-        });
-        const gData = await gRes.json().catch(() => ({}));
-        if (gRes.ok && gData.choices && gData.choices[0]) {
-          const reply = gData.choices[0].message?.content || '';
-          return json({
-            candidates: [
-              {
-                content: { parts: [{ text: reply }], role: 'model' },
-                finishReason: 'STOP',
-              },
-            ],
-            elion_provider: 'groq-fallback',
-          });
-        }
-        lastErr = (gData.error && gData.error.message) || lastErr;
-      }
-    } catch (eG) {
-      lastErr = eG.message || lastErr;
-    }
+
+  if (hasImage) {
+    return json({ error: { message: lastErr } }, lastStatus >= 400 ? lastStatus : 502);
   }
 
-  return json({ error: { message: lastErr } }, lastStatus || 502);
+  if (env.AI) {
+    const w = await chatWorkersAI(body, env, modelsForMode(mode));
+    if (w && w.candidates) return json(w);
+  }
+  if (env.GROQ_API_KEY) {
+    const gr = await chatGroq(body, env);
+    if (gr) return json(gr);
+  }
+
+  return json({ error: { message: lastErr } }, lastStatus >= 400 ? lastStatus : 502);
 }
 
 /* ─── Fluxion: Workers AI Flux 3 Video ─── */
@@ -471,102 +447,6 @@ async function submitFluxionWorkersAI(prompt, opts, env) {
   return { ok: false, error: lastErr };
 }
 
-/* ─── Rewind (vidéo async) ─── */
-function rewindErr(data, status) {
-  if (data == null) return `Rewind HTTP ${status || '?'}`;
-  if (typeof data === 'string') return data.slice(0, 280);
-  const d = data.error || data.detail || data.message || data.msg;
-  if (typeof d === 'string') return d.slice(0, 280);
-  if (d && typeof d === 'object') {
-    try {
-      return (d.message || JSON.stringify(d)).slice(0, 280);
-    } catch (e) {}
-  }
-  try {
-    return JSON.stringify(data).slice(0, 280);
-  } catch (e) {
-    return `Rewind HTTP ${status || '?'}`;
-  }
-}
-
-/** Cherche une URL de vidéo dans une réponse dont la forme n'est pas garantie */
-function findVideoUrl(obj, depth = 0) {
-  if (!obj || depth > 5) return null;
-  if (typeof obj === 'string') {
-    return /^https?:\/\/\S+\.(mp4|webm|mov)(\?\S*)?$/i.test(obj) ? obj : null;
-  }
-  if (Array.isArray(obj)) {
-    for (const it of obj) {
-      const u = findVideoUrl(it, depth + 1);
-      if (u) return u;
-    }
-    return null;
-  }
-  if (typeof obj === 'object') {
-    for (const k of ['video_url', 'videoUrl', 'url', 'video', 'output', 'result', 'data', 'videos']) {
-      if (obj[k] == null) continue;
-      if (typeof obj[k] === 'string' && /^https?:\/\//i.test(obj[k]) && /video|url/i.test(k)) return obj[k];
-      const u = findVideoUrl(obj[k], depth + 1);
-      if (u) return u;
-    }
-  }
-  return null;
-}
-
-async function submitRewindVideo(prompt, opts, env) {
-  const key = rewindKey(env);
-  if (!key) return { ok: false, error: 'REWIND_API_KEY manquante — ajoute le secret Cloudflare REWIND_API_KEY' };
-  const dur = Math.min(12, Math.max(4, Number(opts?.duration) || 5));
-  try {
-    const res = await fetch(REWIND_BASE + '/videos/generate-async', {
-      method: 'POST',
-      headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        prompt: String(prompt || '').slice(0, 1500),
-        duration: dur + 's',
-        aspectRatio: mapFalAspect(opts?.aspect || '16:9'),
-        model: String(env.REWIND_VIDEO_MODEL || REWIND_VIDEO_MODEL).trim(),
-      }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) return { ok: false, error: rewindErr(data, res.status), raw: data };
-    const id =
-      data.job_id || data.jobId || data.id || data.request_id ||
-      data.data?.job_id || data.data?.id || data.job?.id;
-    if (!id) return { ok: false, error: 'Rewind: pas de job id — ' + JSON.stringify(data).slice(0, 160), raw: data };
-    return { ok: true, request_id: 'rw-' + String(id), provider: 'rewind' };
-  } catch (e) {
-    return { ok: false, error: e.message || String(e) };
-  }
-}
-
-async function pollRewindOnce(jobId, env) {
-  const key = rewindKey(env);
-  if (!key) return { ok: false, status: 'FAILED', error: 'REWIND_API_KEY manquante' };
-  try {
-    const res = await fetch(REWIND_BASE + '/jobs/' + encodeURIComponent(jobId), {
-      headers: { Authorization: 'Bearer ' + key },
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) return { ok: false, status: 'FAILED', error: rewindErr(data, res.status), provider: 'rewind' };
-    const st = String(data.status || data.state || data.data?.status || '').toLowerCase();
-    const videoUrl = findVideoUrl(data);
-    if (videoUrl && !/fail|error|cancel/.test(st)) {
-      return { ok: true, status: 'COMPLETED', video_url: videoUrl, url: videoUrl, provider: 'rewind' };
-    }
-    if (/fail|error|cancel/.test(st)) {
-      return { ok: false, status: 'FAILED', error: rewindErr(data, 0), provider: 'rewind', raw: data };
-    }
-    if (/complet|succe|done|finish/.test(st)) {
-      return { ok: false, status: 'FAILED', error: 'Rewind terminé sans URL — ' + JSON.stringify(data).slice(0, 160), provider: 'rewind', raw: data };
-    }
-    const p = Number(data.progress ?? data.data?.progress);
-    return { ok: true, status: 'PROCESSING', progress: Number.isFinite(p) ? p : 10, provider: 'rewind' };
-  } catch (e) {
-    return { ok: false, status: 'FAILED', error: e.message || String(e), provider: 'rewind' };
-  }
-}
-
 /* ─── Fal (Seedance 2.0 + Wan 3) ─── */
 function mapFalDuration(d) {
   const n = Number(d) || 5;
@@ -602,7 +482,8 @@ async function submitFalVideo(modelId, prompt, opts, env) {
   };
   try {
     const res = await fetch(FAL_QUEUE + modelId, {
-    headers: {
+      method: 'POST',
+      headers: {
         Authorization: `Key ${key}`,
         'Content-Type': 'application/json',
       },
@@ -714,7 +595,6 @@ async function submitFluxionFal(prompt, opts, env) {
       return r;
     }
     errors.push((m.split('/').pop() || m) + ': ' + (r.error || 'fail'));
-    if (/exhausted|balance|insufficient|credit|locked|billing|unauthorized|forbidden/i.test(r.error || '')) break;
   }
   return {
     ok: false,
@@ -944,14 +824,13 @@ export default {
         ok: true,
         service: 'elion-relay',
         chat: env.AI ? 'workers-ai→gemini' : (pickGeminiKey(env) ? 'gemini' : 'off'),
-        fluxion_primary: rewindKey(env) ? 'rewind-wan-3.0' : (falKey(env) ? 'seedance-2.0' : 'off'),
+        fluxion_primary: falKey(env) ? 'seedance-2.0' : 'off',
         fluxion_fallback: falKey(env) ? 'wan-3' : 'off',
         fluxion_fallback2: env.AI ? 'workers-ai' : 'off',
         sonaria: env.ACE_MUSIC_API_KEY ? 'ace' : 'off',
         illustro: env.AI ? 'flux-2' : 'off',
         has_ai_binding: !!env.AI,
         has_fal: !!falKey(env),
-        has_rewind: !!rewindKey(env),
         has_gemini: !!pickGeminiKey(env),
         has_groq: !!env.GROQ_API_KEY,
         tip: 'Teste la clé: GET /?ping=gemini',
@@ -981,21 +860,6 @@ export default {
           image_url: body.image_url,
         };
 
-        // 0) Rewind (Wan 3.0)
-        let rw = { ok: false, error: '' };
-        if (rewindKey(env)) {
-          rw = await submitRewindVideo(prompt, opts, env);
-          if (rw.ok) {
-            return json({
-              ok: true,
-              request_id: rw.request_id,
-              id: rw.request_id,
-              provider: 'rewind',
-              status: 'queued',
-            });
-          }
-        }
-
         // 1) Fal Seedance 2.0 → Wan 3
         const fal = await submitFluxionFal(prompt, opts, env);
         if (fal.ok) {
@@ -1021,26 +885,17 @@ export default {
             video_url: cf.video_url,
             url: cf.video_url,
             fal_error: fal.error,
-            rewind_error: rw.error || undefined,
           });
         }
 
         return json(
           {
             ok: false,
-            error:
-              [
-                rw.error && 'Rewind: ' + String(rw.error).slice(0, 60),
-                fal.error && 'Fal: ' + (/exhausted|balance|locked/i.test(fal.error) ? 'crédits épuisés' : String(fal.error).slice(0, 40)),
-                cf.error && 'CF: ' + String(cf.error).slice(0, 60),
-              ]
-                .filter(Boolean)
-                .join(' | ') || 'Fluxion indisponible',
+            error: fal.error || cf.error || 'Fluxion indisponible',
           },
           502
         );
-      }
-
+  }
       /* Fluxion POLL */
       if (body.ltx_status) {
         const id = String(body.ltx_status);
@@ -1053,11 +908,6 @@ export default {
             status: 'FAILED',
             error: 'Job CF déjà terminé côté submit — rafraîchis',
           });
-        }
-
-        // préfixe rw- : la page Works n'envoie pas "provider" au polling
-        if (provider === 'rewind' || id.startsWith('rw-')) {
-          return json(await pollRewindOnce(id.replace(/^rw-/, ''), env));
         }
 
         if (
@@ -1125,4 +975,5 @@ export default {
     }
   },
 };
-        
+
+      
